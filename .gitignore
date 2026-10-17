@@ -22,3 +22,6 @@ Thumbs.db
 
 # Datos locales
 data/raw/
+*.sqlite
+*.sqlite3
+*.db
