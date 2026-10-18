@@ -1,0 +1,58 @@
+{
+  "dataset": {
+    "nombre": "Store Sales - Time Series Forecasting",
+    "contexto": "Datos públicos de ventas de Corporación Favorita",
+    "archivo": "data/raw/train.csv",
+    "sha256": "99a1b7f4241821df10fa71f23abdd71c634f71f901e3cab1400c0f0c583f862c"
+  },
+  "periodo_seleccion": {
+    "inicio": "2013-01-01",
+    "fin": "2017-06-16"
+  },
+  "horizonte_prediccion_dias": 15,
+  "regla_seleccion": {
+    "version": "1.0",
+    "granularidad": ["store_nbr", "family"],
+    "excluir_volumen_total_cero": true,
+    "denominador_porcentaje_ceros": "filas existentes de la serie",
+    "transformacion_volumen": "log1p",
+    "percentiles_por_cuota": {
+      "2": [25, 75],
+      "3": [20, 50, 80]
+    },
+    "orden_grupos": ["A", "B", "C", "D"],
+    "desempate": ["store_nbr ascendente", "family alfabeticamente"],
+    "maximo_series_por_tienda": 2,
+    "maximo_series_por_familia": 2,
+    "grupos": {
+      "A": {
+        "porcentaje_ceros": {"minimo": 0, "minimo_inclusivo": true, "maximo": 5, "maximo_inclusivo": true},
+        "cuota": 2
+      },
+      "B": {
+        "porcentaje_ceros": {"minimo": 5, "minimo_inclusivo": false, "maximo": 35, "maximo_inclusivo": true},
+        "cuota": 3
+      },
+      "C": {
+        "porcentaje_ceros": {"minimo": 35, "minimo_inclusivo": false, "maximo": 70, "maximo_inclusivo": true},
+        "cuota": 3
+      },
+      "D": {
+        "porcentaje_ceros": {"minimo": 70, "minimo_inclusivo": false, "maximo": 100, "maximo_inclusivo": false},
+        "cuota": 2
+      }
+    }
+  },
+  "series": [
+    {"grupo": "A", "store_nbr": 17, "family": "PREPARED FOODS"},
+    {"grupo": "A", "store_nbr": 8, "family": "BREAD/BAKERY"},
+    {"grupo": "B", "store_nbr": 30, "family": "LINGERIE"},
+    {"grupo": "B", "store_nbr": 37, "family": "HOME AND KITCHEN II"},
+    {"grupo": "B", "store_nbr": 18, "family": "PERSONAL CARE"},
+    {"grupo": "C", "store_nbr": 29, "family": "BEAUTY"},
+    {"grupo": "C", "store_nbr": 37, "family": "PET SUPPLIES"},
+    {"grupo": "C", "store_nbr": 29, "family": "POULTRY"},
+    {"grupo": "D", "store_nbr": 23, "family": "HARDWARE"},
+    {"grupo": "D", "store_nbr": 5, "family": "SCHOOL AND OFFICE SUPPLIES"}
+  ]
+}
