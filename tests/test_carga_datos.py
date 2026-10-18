@@ -95,6 +95,7 @@ class CargaDatosTests(unittest.TestCase):
         self.assertFalse(resultado.exito)
         self.assertIsNone(resultado.conjunto_id)
         self.assertTrue(resultado.errores)
+        self.assertEqual(resultado.codigo_error, "csv_invalido")
         self.assertEqual(self.estado(), anterior)
 
     def test_segunda_carga_desactiva_la_anterior_sin_borrarla(self) -> None:
@@ -129,6 +130,7 @@ class CargaDatosTests(unittest.TestCase):
         resultado = self.cargar(lote=1)
         self.assertFalse(resultado.exito)
         self.assertIn("fallo simulado", resultado.errores[0])
+        self.assertEqual(resultado.codigo_error, "fallo_interno")
         self.assertEqual(self.estado(), anterior)
 
     def test_error_de_activacion_revierte_todo(self) -> None:
@@ -146,6 +148,7 @@ class CargaDatosTests(unittest.TestCase):
         resultado = self.cargar()
         self.assertFalse(resultado.exito)
         self.assertIn("fallo simulado", resultado.errores[0])
+        self.assertEqual(resultado.codigo_error, "fallo_interno")
         self.assertEqual(self.estado(), anterior)
 
     def test_sin_series_habilitadas_no_modifica_la_base(self) -> None:
@@ -156,6 +159,7 @@ class CargaDatosTests(unittest.TestCase):
         resultado = self.cargar()
         self.assertFalse(resultado.exito)
         self.assertIn("no hay series utilizables", resultado.errores[0])
+        self.assertEqual(resultado.codigo_error, "sin_series_utilizables")
         self.assertEqual(self.estado(), anterior)
 
     def test_subconjunto_informa_las_nueve_series_ausentes(self) -> None:
@@ -194,7 +198,17 @@ class CargaDatosTests(unittest.TestCase):
         inexistente = self.base.with_name("inexistente.sqlite3")
         resultado = cargar_csv(self.csv, inexistente, self.config)
         self.assertFalse(resultado.exito)
+        self.assertEqual(resultado.codigo_error, "base_no_disponible")
         self.assertFalse(inexistente.exists())
+
+    def test_configuracion_invalida_tiene_codigo_propio(self) -> None:
+        self.escribir([["2017-06-16", "17", "PREPARED FOODS", "1", "0"]])
+        self.config.write_text("{}", encoding="utf-8")
+        resultado = self.cargar()
+        self.assertFalse(resultado.exito)
+        self.assertEqual(resultado.codigo_error, "configuracion_invalida")
+        self.assertTrue(resultado.errores)
+        self.assertEqual(self.estado(), ([], [], []))
 
 
 if __name__ == "__main__":

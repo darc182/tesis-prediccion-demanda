@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 from tempfile import TemporaryDirectory
+from typing import Literal, TypeAlias
 
 from backend.app.services.validacion_csv import validar_csv
 from backend.app.storage.db import conectar
@@ -23,6 +24,10 @@ from backend.app.storage.db import conectar
 
 CONFIG_SERIES = Path(__file__).resolve().parents[3] / "config" / "series_seleccionadas.json"
 TAMANO_LOTE = 1_000
+CodigoFalloCarga: TypeAlias = Literal[
+    "csv_invalido", "sin_series_utilizables", "base_no_disponible",
+    "configuracion_invalida", "fallo_interno",
+]
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,7 @@ class ResultadoCargaDatos:
     observaciones_importadas: int
     errores: tuple[str, ...]
     advertencias: tuple[str, ...]
+    codigo_error: CodigoFalloCarga | None = None
 
 
 def _series_habilitadas(ruta_config: Path) -> dict[tuple[int, str], str]:
@@ -58,8 +64,10 @@ def _series_habilitadas(ruta_config: Path) -> dict[tuple[int, str], str]:
     return habilitadas
 
 
-def _fallo(mensaje: str, sha256: str | None = None) -> ResultadoCargaDatos:
-    return ResultadoCargaDatos(False, None, sha256, 0, 0, (mensaje,), ())
+def _fallo(
+    mensaje: str, codigo_error: CodigoFalloCarga, sha256: str | None = None,
+) -> ResultadoCargaDatos:
+    return ResultadoCargaDatos(False, None, sha256, 0, 0, (mensaje,), (), codigo_error)
 
 
 def cargar_csv(
@@ -87,17 +95,17 @@ def cargar_csv(
             if not validacion.valido:
                 return ResultadoCargaDatos(
                     False, None, validacion.sha256, 0, 0,
-                    validacion.errores, (),
+                    validacion.errores, (), "csv_invalido",
                 )
 
             try:
                 habilitadas = _series_habilitadas(ruta_config)
             except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
                 return _fallo(f"No se pudo leer la configuración de series: {error}",
-                              validacion.sha256)
+                              "configuracion_invalida", validacion.sha256)
             if not ruta_base.is_file():
                 return _fallo("La base SQLite no existe o no está inicializada.",
-                              validacion.sha256)
+                              "base_no_disponible", validacion.sha256)
 
             try:
                 with closing(conectar(ruta_base)) as conexion:
@@ -147,7 +155,8 @@ def cargar_csv(
                             conexion.rollback()
                             return _fallo(
                                 "El CSV no contiene ninguna de las series habilitadas; "
-                                "no hay series utilizables.", validacion.sha256,
+                                "no hay series utilizables.",
+                                "sin_series_utilizables", validacion.sha256,
                             )
                         if lote:
                             conexion.executemany(
@@ -165,11 +174,17 @@ def cargar_csv(
                         conexion.commit()
                     except Exception as error:
                         conexion.rollback()
+                        codigo_error: CodigoFalloCarga = (
+                            "base_no_disponible"
+                            if isinstance(error, sqlite3.DatabaseError)
+                            and not isinstance(error, sqlite3.IntegrityError)
+                            else "fallo_interno"
+                        )
                         return _fallo(f"La carga se revirtió por un error: {error}",
-                                      validacion.sha256)
+                                      codigo_error, validacion.sha256)
             except (OSError, sqlite3.Error) as error:
                 return _fallo(f"No se pudo abrir la base SQLite: {error}",
-                              validacion.sha256)
+                              "base_no_disponible", validacion.sha256)
 
             ausentes = [
                 f"Falta la serie tienda {tienda}, familia {familia} (grupo {grupo})."
@@ -181,4 +196,4 @@ def cargar_csv(
                 observaciones, (), tuple(ausentes),
             )
     except (OSError, UnicodeError, ValueError) as error:
-        return _fallo(f"No se pudo preparar la carga: {error}")
+        return _fallo(f"No se pudo preparar la carga: {error}", "fallo_interno")
