@@ -1,10 +1,12 @@
-"""Endpoint HTTP para cargar CSV mediante el servicio transaccional existente."""
+"""Endpoints HTTP de carga y consulta del conjunto de datos activo."""
 
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from contextlib import closing
+from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -105,6 +107,73 @@ def consultar_series_activas(ruta_base: Path = Depends(obtener_ruta_base)) -> di
         "series": [
             {"id": serie_id, "store_nbr": tienda, "family": familia}
             for _, serie_id, tienda, familia in filas if serie_id is not None
+        ],
+    }
+
+
+def _validar_fecha(nombre: str, valor: str | None) -> str | None:
+    if valor is None:
+        return None
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", valor) is None:
+        raise HTTPException(status_code=422, detail=f"{nombre} debe tener el formato YYYY-MM-DD.")
+    try:
+        date.fromisoformat(valor)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=f"{nombre} debe ser una fecha real.") from error
+    return valor
+
+
+@router.get("/active/series/{serie_id}/sales")
+def consultar_ventas_historicas(
+    serie_id: int,
+    desde: str | None = None,
+    hasta: str | None = None,
+    ruta_base: Path = Depends(obtener_ruta_base),
+) -> dict:
+    """Devuelve solo las observaciones almacenadas de una serie del conjunto activo."""
+    desde = _validar_fecha("desde", desde)
+    hasta = _validar_fecha("hasta", hasta)
+    if desde is not None and hasta is not None and desde > hasta:
+        raise HTTPException(status_code=422, detail="desde no puede ser posterior a hasta.")
+
+    consulta = """
+        SELECT c.id, s.id, s.store_nbr, s.family, v.fecha, v.sales, v.onpromotion
+        FROM (
+            SELECT id FROM conjunto_datos WHERE activo = 1
+            ORDER BY id DESC LIMIT 1
+        ) AS c
+        JOIN serie_temporal AS s ON s.conjunto_id = c.id AND s.id = ?
+        LEFT JOIN venta_diaria AS v ON v.serie_id = s.id
+    """
+    parametros: list[int | str] = [serie_id]
+    if desde is not None:
+        consulta += " AND v.fecha >= ?"
+        parametros.append(desde)
+    if hasta is not None:
+        consulta += " AND v.fecha <= ?"
+        parametros.append(hasta)
+    consulta += " ORDER BY v.fecha ASC"
+
+    try:
+        uri = f"{ruta_base.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conexion:
+            filas = conexion.execute(consulta, parametros).fetchall()
+    except (sqlite3.Error, OSError, ValueError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="La base de datos no está disponible o no tiene el esquema necesario.",
+        ) from error
+
+    if not filas:
+        raise HTTPException(status_code=404, detail="La serie no existe en el conjunto activo.")
+
+    conjunto_id, id_serie, tienda, familia = filas[0][:4]
+    return {
+        "conjunto_id": conjunto_id,
+        "serie": {"id": id_serie, "store_nbr": tienda, "family": familia},
+        "observaciones": [
+            {"fecha": fecha, "sales": sales, "onpromotion": onpromotion}
+            for _, _, _, _, fecha, sales, onpromotion in filas if fecha is not None
         ],
     }
 
