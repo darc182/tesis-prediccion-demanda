@@ -50,14 +50,16 @@
 }
 
 .upload-card,
-.feedback {
+.feedback,
+.series-card {
   padding: clamp(20px, 4vw, 32px);
   border: 1px solid var(--border);
   border-radius: 12px;
 }
 
 .upload-card h2,
-.feedback h2 {
+.feedback h2,
+.series-card h2 {
   margin: 0 0 20px;
 }
 
@@ -71,6 +73,70 @@
 .upload-card label {
   color: var(--text-h);
   font-weight: 600;
+}
+
+.series-card {
+  margin-top: 24px;
+  line-height: 1.5;
+}
+
+.series-intro {
+  margin-bottom: 20px;
+}
+
+.series-count {
+  margin-bottom: 16px;
+}
+
+.series-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  gap: 16px;
+}
+
+.series-filters label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.series-filters select {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+}
+
+.series-filters select:disabled {
+  opacity: 0.65;
+}
+
+.series-selection {
+  margin-top: 20px;
+}
+
+.series-selection strong {
+  color: var(--text-h);
+}
+
+.retry-button {
+  margin-top: 16px;
+  padding: 10px 16px;
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  background: var(--accent-bg);
+  color: var(--text-h);
+  font: inherit;
+  cursor: pointer;
+}
+
+.series-card :focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
 }
 
 .upload-card input[type='file'] {

@@ -1,4 +1,5 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
+import SelectorSerie, { type SerieTemporal, type SeriesState } from './components/SelectorSerie'
 import './App.css'
 
 type ConnectionStatus = 'connecting' | 'connected' | 'error'
@@ -18,6 +19,33 @@ type UploadState =
   | { kind: 'client-error' | 'network-error' | 'response-error'; message: string }
   | { kind: 'server-error'; result: UploadResult; status: number }
   | { kind: 'success'; result: UploadResult }
+
+type SeriesResponse = {
+  conjunto_id: number | null
+  series: SerieTemporal[]
+}
+
+function isSeriesResponse(value: unknown): value is SeriesResponse {
+  if (typeof value !== 'object' || value === null) return false
+  const data = value as Record<string, unknown>
+  const validId = data.conjunto_id === null ||
+    (typeof data.conjunto_id === 'number' && Number.isInteger(data.conjunto_id) && data.conjunto_id > 0)
+  if (!validId || !Array.isArray(data.series)) return false
+  if (data.conjunto_id === null && data.series.length > 0) return false
+
+  const keys = new Set<string>()
+  return data.series.every((item: unknown) => {
+    if (typeof item !== 'object' || item === null) return false
+    const serie = item as Record<string, unknown>
+    if (typeof serie.id !== 'number' || !Number.isInteger(serie.id) || serie.id <= 0 ||
+        typeof serie.store_nbr !== 'number' || !Number.isInteger(serie.store_nbr) || serie.store_nbr <= 0 ||
+        typeof serie.family !== 'string' || !serie.family.trim()) return false
+    const key = JSON.stringify([serie.store_nbr, serie.family])
+    if (keys.has(key)) return false
+    keys.add(key)
+    return true
+  })
+}
 
 function isUploadResult(value: unknown): value is UploadResult {
   if (typeof value !== 'object' || value === null) return false
@@ -52,6 +80,70 @@ function App() {
   const [connection, setConnection] = useState<ConnectionStatus>('connecting')
   const [file, setFile] = useState<File | null>(null)
   const [upload, setUpload] = useState<UploadState>({ kind: 'idle' })
+  const [seriesState, setSeriesState] = useState<SeriesState>({ kind: 'loading' })
+  const [selectedStore, setSelectedStore] = useState<number | null>(null)
+  const [selectedFamily, setSelectedFamily] = useState<string | null>(null)
+  const seriesRequest = useRef<AbortController | null>(null)
+
+  const refreshSeries = useCallback(async () => {
+    seriesRequest.current?.abort()
+    const controller = new AbortController()
+    seriesRequest.current = controller
+
+    try {
+      let response: Response
+      try {
+        response = await fetch('/api/datasets/active/series', { signal: controller.signal })
+      } catch {
+        if (!controller.signal.aborted) setSeriesState({
+          kind: 'network-error',
+          message: 'No se pudo conectar para consultar las series. Compruebe la conexión con FastAPI.',
+        })
+        return
+      }
+
+      if (controller.signal.aborted) return
+      if (!response.ok) {
+        setSeriesState({
+          kind: 'response-error',
+          message: `No se pudieron consultar las series (HTTP ${response.status}).`,
+        })
+        return
+      }
+
+      let body: unknown
+      try {
+        body = await response.json()
+      } catch {
+        if (!controller.signal.aborted) setSeriesState({
+          kind: 'response-error',
+          message: 'La API no devolvió un JSON válido para las series.',
+        })
+        return
+      }
+
+      if (controller.signal.aborted) return
+      if (!isSeriesResponse(body)) {
+        setSeriesState({
+          kind: 'response-error',
+          message: 'La respuesta de series de la API tiene un formato inválido.',
+        })
+      } else if (body.conjunto_id === null) {
+        setSeriesState({ kind: 'no-active' })
+      } else if (body.series.length === 0) {
+        setSeriesState({ kind: 'empty' })
+      } else {
+        setSeriesState({ kind: 'available', conjuntoId: body.conjunto_id, series: body.series })
+      }
+    } finally {
+      if (seriesRequest.current === controller) seriesRequest.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshSeries()
+    return () => seriesRequest.current?.abort()
+  }, [refreshSeries])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -147,6 +239,37 @@ function App() {
     }
 
     setUpload({ kind: 'success', result: body })
+    setSelectedStore(null)
+    setSelectedFamily(null)
+    setSeriesState({ kind: 'loading' })
+    void refreshSeries()
+  }
+
+  function handleRetrySeries() {
+    setSelectedStore(null)
+    setSelectedFamily(null)
+    setSeriesState({ kind: 'loading' })
+    void refreshSeries()
+  }
+
+  function handleStoreChange(store: number | null) {
+    if (store !== null &&
+        (seriesState.kind !== 'available' || !seriesState.series.some((serie) => serie.store_nbr === store))) return
+    setSelectedStore(store)
+    setSelectedFamily((family) =>
+      family !== null && seriesState.kind === 'available' &&
+      seriesState.series.some((serie) => serie.store_nbr === store && serie.family === family)
+        ? family : null,
+    )
+  }
+
+  function handleFamilyChange(family: string | null) {
+    if (seriesState.kind !== 'available' || selectedStore === null) return
+    setSelectedFamily(
+      family !== null && seriesState.series.some(
+        (serie) => serie.store_nbr === selectedStore && serie.family === family,
+      ) ? family : null,
+    )
   }
 
   const processing = upload.kind === 'processing'
@@ -234,6 +357,15 @@ function App() {
           )}
         </section>
       )}
+
+      <SelectorSerie
+        state={seriesState}
+        selectedStore={selectedStore}
+        selectedFamily={selectedFamily}
+        onStoreChange={handleStoreChange}
+        onFamilyChange={handleFamilyChange}
+        onRetry={handleRetrySeries}
+      />
     </main>
   )
 }
