@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 from backend.app.services.carga_datos import (
@@ -72,6 +74,39 @@ def _codigo_fallo(resultado: ResultadoCargaDatos) -> int:
         "configuracion_invalida": 500,
         "fallo_interno": 500,
     }.get(resultado.codigo_error, 500)
+
+
+@router.get("/active/series")
+def consultar_series_activas(ruta_base: Path = Depends(obtener_ruta_base)) -> dict:
+    """Consulta las series del conjunto activo sin crear ni modificar la base."""
+    consulta = """
+        SELECT c.id, s.id, s.store_nbr, s.family
+        FROM (
+            SELECT id FROM conjunto_datos WHERE activo = 1
+            ORDER BY id DESC LIMIT 1
+        ) AS c
+        LEFT JOIN serie_temporal AS s ON s.conjunto_id = c.id
+        ORDER BY s.store_nbr ASC, s.family ASC
+    """
+    try:
+        uri = f"{ruta_base.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conexion:
+            filas = conexion.execute(consulta).fetchall()
+    except (sqlite3.Error, OSError, ValueError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="La base de datos no está disponible o no tiene el esquema necesario.",
+        ) from error
+
+    if not filas:
+        return {"conjunto_id": None, "series": []}
+    return {
+        "conjunto_id": filas[0][0],
+        "series": [
+            {"id": serie_id, "store_nbr": tienda, "family": familia}
+            for _, serie_id, tienda, familia in filas if serie_id is not None
+        ],
+    }
 
 
 @router.post("/upload")
