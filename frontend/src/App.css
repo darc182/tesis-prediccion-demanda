@@ -51,7 +51,8 @@
 
 .upload-card,
 .feedback,
-.series-card {
+.series-card,
+.history-card {
   padding: clamp(20px, 4vw, 32px);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -59,7 +60,8 @@
 
 .upload-card h2,
 .feedback h2,
-.series-card h2 {
+.series-card h2,
+.history-card h2 {
   margin: 0 0 20px;
 }
 
@@ -137,6 +139,175 @@
 .series-card :focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: 3px;
+}
+
+.history-card {
+  margin-top: 24px;
+  line-height: 1.5;
+}
+
+.history-series {
+  margin-bottom: 20px;
+  overflow-wrap: anywhere;
+}
+
+.history-series strong,
+.history-period strong {
+  color: var(--text-h);
+}
+
+.history-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr));
+  align-items: end;
+  gap: 16px;
+}
+
+.history-form label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.history-form input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+}
+
+.history-form button {
+  padding: 11px 16px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.history-form button:disabled,
+.history-pagination button:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.history-card :focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.history-message,
+.history-results {
+  margin-top: 24px;
+}
+
+.history-error {
+  color: #a02b2b;
+}
+
+.history-period {
+  margin-bottom: 8px;
+}
+
+.history-chart {
+  margin: 24px 0;
+  overflow-x: auto;
+}
+
+.history-chart svg {
+  display: block;
+  width: 100%;
+  min-width: 620px;
+  height: auto;
+}
+
+.history-chart figcaption {
+  margin-top: 8px;
+  font-size: 0.85rem;
+}
+
+.chart-grid {
+  stroke: var(--border);
+}
+
+.chart-axis {
+  stroke: var(--text);
+}
+
+.chart-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.chart-point {
+  fill: var(--accent);
+}
+
+.chart-label,
+.chart-axis-title {
+  fill: var(--text-h);
+  font-size: 13px;
+}
+
+.chart-axis-title {
+  font-weight: 600;
+}
+
+.history-table-wrap {
+  overflow-x: auto;
+}
+
+.history-table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-table-wrap caption {
+  margin-bottom: 8px;
+  text-align: left;
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.history-table-wrap th,
+.history-table-wrap td {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.history-table-wrap th {
+  color: var(--text-h);
+}
+
+.history-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.history-pagination button {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+  cursor: pointer;
 }
 
 .upload-card input[type='file'] {
@@ -245,6 +416,10 @@
   }
 
   .connection-status--error {
+    color: #f5b1b1;
+  }
+
+  .history-error {
     color: #f5b1b1;
   }
 }

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
+import HistoricoVentas from './components/HistoricoVentas'
 import SelectorSerie, { type SerieTemporal, type SeriesState } from './components/SelectorSerie'
 import './App.css'
 
@@ -273,6 +274,14 @@ function App() {
   }
 
   const processing = upload.kind === 'processing'
+  const serieSeleccionada = seriesState.kind === 'available' &&
+    selectedStore !== null && selectedFamily !== null
+    ? seriesState.series.find((serie) =>
+      serie.store_nbr === selectedStore && serie.family === selectedFamily)
+    : undefined
+  const seleccionHistorico = seriesState.kind === 'available' && serieSeleccionada
+    ? { conjuntoId: seriesState.conjuntoId, serie: serieSeleccionada }
+    : null
 
   return (
     <main className="upload-page">
@@ -365,6 +374,10 @@ function App() {
         onStoreChange={handleStoreChange}
         onFamilyChange={handleFamilyChange}
         onRetry={handleRetrySeries}
+      />
+      <HistoricoVentas
+        key={seleccionHistorico ? `${seleccionHistorico.conjuntoId}:${seleccionHistorico.serie.id}` : 'sin-serie'}
+        seleccion={seleccionHistorico}
       />
     </main>
   )
