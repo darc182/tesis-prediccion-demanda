@@ -14,10 +14,11 @@ type EstadoHistorico =
   | { kind: 'date-error' | 'network-error' | 'http-error' | 'invalid-response'; message: string }
   | { kind: 'success'; data: RespuestaHistorico; periodo: Periodo }
 
-type Props = { seleccion: Seleccion | null }
+type Props = { seleccion: Seleccion | null; activo: boolean }
 
 const TAMANO_PAGINA = 25
 const MILISEGUNDOS_DIA = 24 * 60 * 60 * 1000
+const CANCELACION_NAVEGACION = 'cambio-de-apartado'
 const formatoVentas = new Intl.NumberFormat('es-EC', { maximumFractionDigits: 6 })
 const formatoEje = new Intl.NumberFormat('es-EC', { maximumSignificantDigits: 4 })
 
@@ -154,7 +155,7 @@ function GraficoVentas({ observaciones }: { observaciones: Observacion[] }) {
   )
 }
 
-function HistoricoVentas({ seleccion }: Props) {
+function HistoricoVentas({ seleccion, activo }: Props) {
   const [desde, setDesde] = useState('')
   const [hasta, setHasta] = useState('')
   const [estado, setEstado] = useState<EstadoHistorico>({ kind: 'idle' })
@@ -162,10 +163,16 @@ function HistoricoVentas({ seleccion }: Props) {
   const solicitud = useRef<AbortController | null>(null)
 
   useEffect(() => () => solicitud.current?.abort(), [])
+  useEffect(() => {
+    if (!activo && solicitud.current) {
+      solicitud.current.abort(CANCELACION_NAVEGACION)
+      solicitud.current = null
+    }
+  }, [activo])
 
   async function consultar(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (seleccion === null) return
+    if (seleccion === null || !activo) return
     solicitud.current?.abort()
     solicitud.current = null
     if (desde && hasta && desde > hasta) {
@@ -174,6 +181,11 @@ function HistoricoVentas({ seleccion }: Props) {
     }
 
     const controller = new AbortController()
+    controller.signal.addEventListener('abort', () => {
+      if (controller.signal.reason === CANCELACION_NAVEGACION) {
+        setEstado((actual) => actual.kind === 'loading' ? { kind: 'idle' } : actual)
+      }
+    }, { once: true })
     solicitud.current = controller
     const periodo = { desde, hasta }
     const parametros = new URLSearchParams()

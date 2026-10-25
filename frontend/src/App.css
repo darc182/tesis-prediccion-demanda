@@ -1,4 +1,4 @@
-.upload-page {
+.app-page {
   width: min(100%, 760px);
   margin: 0 auto;
   padding: clamp(24px, 5vw, 64px) 20px 64px;
@@ -8,6 +8,58 @@
 
 .page-header {
   margin-bottom: 32px;
+}
+
+.main-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 28px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.main-nav button {
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+  cursor: pointer;
+}
+
+.main-nav button[aria-current='page'] {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  font-weight: 700;
+}
+
+.main-nav button:hover {
+  border-color: var(--accent-border);
+}
+
+.main-nav button:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.app-view > :first-child {
+  margin-top: 0;
+}
+
+.app-view[hidden] {
+  display: none;
+}
+
+.pending-view {
+  padding: clamp(20px, 4vw, 32px);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.pending-view h2 {
+  margin-bottom: 12px;
 }
 
 .eyebrow {
@@ -421,5 +473,16 @@
 
   .history-error {
     color: #f5b1b1;
+  }
+}
+
+@media (max-width: 560px) {
+  .main-nav {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .main-nav button {
+    min-width: 0;
   }
 }

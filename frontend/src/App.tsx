@@ -4,6 +4,15 @@ import SelectorSerie, { type SerieTemporal, type SeriesState } from './component
 import './App.css'
 
 type ConnectionStatus = 'connecting' | 'connected' | 'error'
+type Vista = 'datos' | 'historico' | 'pronosticos' | 'comparacion' | 'simulacion'
+
+const apartados: { id: Vista; nombre: string }[] = [
+  { id: 'datos', nombre: 'Datos' },
+  { id: 'historico', nombre: 'Histórico' },
+  { id: 'pronosticos', nombre: 'Pronósticos' },
+  { id: 'comparacion', nombre: 'Comparación' },
+  { id: 'simulacion', nombre: 'Simulación' },
+]
 
 type UploadResult = {
   exito: boolean
@@ -78,6 +87,7 @@ function formatoTamano(bytes: number): string {
 }
 
 function App() {
+  const [vista, setVista] = useState<Vista>('datos')
   const [connection, setConnection] = useState<ConnectionStatus>('connecting')
   const [file, setFile] = useState<File | null>(null)
   const [upload, setUpload] = useState<UploadState>({ kind: 'idle' })
@@ -284,101 +294,126 @@ function App() {
     : null
 
   return (
-    <main className="upload-page">
+    <main className="app-page">
       <header className="page-header">
-        <p className="eyebrow">Gestión de datos</p>
-        <h1>Carga de archivos CSV</h1>
+        <p className="eyebrow">Análisis de inventario</p>
+        <h1>Predicción de demanda</h1>
         <p className="intro">
-          Seleccione un archivo de ventas para validarlo e importar las series habilitadas.
+          Gestione los datos y consulte las ventas históricas por tienda y familia de producto.
         </p>
         <p className={`connection-status connection-status--${connection}`} role="status" aria-live="polite">
           {connectionMessages[connection]}
         </p>
       </header>
 
-      <section className="upload-card" aria-labelledby="upload-heading">
-        <h2 id="upload-heading">Seleccionar archivo</h2>
-        <form onSubmit={(event) => { void handleSubmit(event) }} aria-busy={processing}>
-          <label htmlFor="csv-file">Archivo CSV</label>
-          <input
-            id="csv-file"
-            type="file"
-            accept=".csv,text/csv"
-            disabled={processing}
-            aria-describedby="file-help"
-            onChange={(event) => {
-              setFile(event.target.files?.[0] ?? null)
-              setUpload({ kind: 'idle' })
-            }}
-          />
-          <p id="file-help" className="help-text">
-            Se comprobarán el formato y las series disponibles al enviar el archivo.
-          </p>
-          {file && (
-            <p className="file-details">
-              Seleccionado: <strong>{file.name}</strong> · {formatoTamano(file.size)}
+      <nav className="main-nav" aria-label="Navegación principal">
+        {apartados.map((apartado) => (
+          <button
+            key={apartado.id}
+            type="button"
+            aria-current={vista === apartado.id ? 'page' : undefined}
+            onClick={() => setVista(apartado.id)}
+          >
+            {apartado.nombre}
+          </button>
+        ))}
+      </nav>
+
+      <section className="app-view" aria-label="Datos" hidden={vista !== 'datos'}>
+        <section className="upload-card" aria-labelledby="upload-heading">
+          <h2 id="upload-heading">Seleccionar archivo</h2>
+          <form onSubmit={(event) => { void handleSubmit(event) }} aria-busy={processing}>
+            <label htmlFor="csv-file">Archivo CSV</label>
+            <input
+              id="csv-file"
+              type="file"
+              accept=".csv,text/csv"
+              disabled={processing}
+              aria-describedby="file-help"
+              onChange={(event) => {
+                setFile(event.target.files?.[0] ?? null)
+                setUpload({ kind: 'idle' })
+              }}
+            />
+            <p id="file-help" className="help-text">
+              Se comprobarán el formato y las series disponibles al enviar el archivo.
             </p>
-          )}
-          <button type="submit" disabled={processing}>Cargar y validar datos</button>
-        </form>
+            {file && (
+              <p className="file-details">
+                Seleccionado: <strong>{file.name}</strong> · {formatoTamano(file.size)}
+              </p>
+            )}
+            <button type="submit" disabled={processing}>Cargar y validar datos</button>
+          </form>
+        </section>
+
+        {upload.kind === 'processing' && (
+          <section className="feedback feedback--processing" role="status" aria-live="polite">
+            <h2>Procesando archivo…</h2>
+            <p>La validación y la carga de archivos grandes pueden tardar varios minutos.</p>
+          </section>
+        )}
+
+        {(upload.kind === 'client-error' || upload.kind === 'network-error' ||
+          upload.kind === 'response-error') && (
+          <section className="feedback feedback--error" role="alert">
+            <h2>No se pudo completar la carga</h2>
+            <p>{upload.message}</p>
+          </section>
+        )}
+
+        {upload.kind === 'server-error' && (
+          <section className="feedback feedback--error" role="alert">
+            <h2>Carga rechazada</h2>
+            <p>Respuesta HTTP {upload.status}.</p>
+            {upload.result.errores.length > 0 ? (
+              <ul>{upload.result.errores.map((error, index) => <li key={index}>{error}</li>)}</ul>
+            ) : (
+              <p>El servidor no proporcionó un mensaje de error.</p>
+            )}
+          </section>
+        )}
+
+        {upload.kind === 'success' && (
+          <section className="feedback feedback--success" role="status" aria-live="polite">
+            <h2>Datos cargados correctamente</h2>
+            <dl className="result-summary">
+              <div><dt>Conjunto</dt><dd>{upload.result.conjunto_id}</dd></div>
+              <div><dt>Series importadas</dt><dd>{upload.result.series_importadas}</dd></div>
+              <div><dt>Observaciones importadas</dt><dd>{upload.result.observaciones_importadas}</dd></div>
+            </dl>
+            {upload.result.advertencias.length > 0 && (
+              <div className="warnings">
+                <h3>Advertencias</h3>
+                <ul>{upload.result.advertencias.map((warning, index) => <li key={index}>{warning}</li>)}</ul>
+              </div>
+            )}
+          </section>
+        )}
       </section>
 
-      {upload.kind === 'processing' && (
-        <section className="feedback feedback--processing" role="status" aria-live="polite">
-          <h2>Procesando archivo…</h2>
-          <p>La validación y la carga de archivos grandes pueden tardar varios minutos.</p>
+      <section className="app-view" aria-label="Histórico" hidden={vista !== 'historico'}>
+        <SelectorSerie
+          state={seriesState}
+          selectedStore={selectedStore}
+          selectedFamily={selectedFamily}
+          onStoreChange={handleStoreChange}
+          onFamilyChange={handleFamilyChange}
+          onRetry={handleRetrySeries}
+        />
+        <HistoricoVentas
+          key={seleccionHistorico ? `${seleccionHistorico.conjuntoId}:${seleccionHistorico.serie.id}` : 'sin-serie'}
+          seleccion={seleccionHistorico}
+          activo={vista === 'historico'}
+        />
+      </section>
+
+      {vista !== 'datos' && vista !== 'historico' && (
+        <section className="pending-view" aria-labelledby="pending-heading">
+          <h2 id="pending-heading">{apartados.find((apartado) => apartado.id === vista)?.nombre}</h2>
+          <p>Este apartado todavía no está disponible.</p>
         </section>
       )}
-
-      {(upload.kind === 'client-error' || upload.kind === 'network-error' ||
-        upload.kind === 'response-error') && (
-        <section className="feedback feedback--error" role="alert">
-          <h2>No se pudo completar la carga</h2>
-          <p>{upload.message}</p>
-        </section>
-      )}
-
-      {upload.kind === 'server-error' && (
-        <section className="feedback feedback--error" role="alert">
-          <h2>Carga rechazada</h2>
-          <p>Respuesta HTTP {upload.status}.</p>
-          {upload.result.errores.length > 0 ? (
-            <ul>{upload.result.errores.map((error, index) => <li key={index}>{error}</li>)}</ul>
-          ) : (
-            <p>El servidor no proporcionó un mensaje de error.</p>
-          )}
-        </section>
-      )}
-
-      {upload.kind === 'success' && (
-        <section className="feedback feedback--success" role="status" aria-live="polite">
-          <h2>Datos cargados correctamente</h2>
-          <dl className="result-summary">
-            <div><dt>Conjunto</dt><dd>{upload.result.conjunto_id}</dd></div>
-            <div><dt>Series importadas</dt><dd>{upload.result.series_importadas}</dd></div>
-            <div><dt>Observaciones importadas</dt><dd>{upload.result.observaciones_importadas}</dd></div>
-          </dl>
-          {upload.result.advertencias.length > 0 && (
-            <div className="warnings">
-              <h3>Advertencias</h3>
-              <ul>{upload.result.advertencias.map((warning, index) => <li key={index}>{warning}</li>)}</ul>
-            </div>
-          )}
-        </section>
-      )}
-
-      <SelectorSerie
-        state={seriesState}
-        selectedStore={selectedStore}
-        selectedFamily={selectedFamily}
-        onStoreChange={handleStoreChange}
-        onFamilyChange={handleFamilyChange}
-        onRetry={handleRetrySeries}
-      />
-      <HistoricoVentas
-        key={seleccionHistorico ? `${seleccionHistorico.conjuntoId}:${seleccionHistorico.serie.id}` : 'sin-serie'}
-        seleccion={seleccionHistorico}
-      />
     </main>
   )
 }
