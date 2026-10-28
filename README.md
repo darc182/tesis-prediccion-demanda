@@ -47,7 +47,7 @@ La aplicación necesita un CSV con las columnas esperadas por la carga para most
 Desde la raíz, con el entorno de Python activo y las dependencias de prueba instaladas:
 
 ```powershell
-python -m pip install -r backend/requirements-test.txt
+python -m pip install -r backend/requirements-test.txt pandas
 python -m unittest discover -s tests
 ```
 
