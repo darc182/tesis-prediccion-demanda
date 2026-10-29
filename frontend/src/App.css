@@ -486,3 +486,38 @@
     min-width: 0;
   }
 }
+
+.forecast-card {
+  margin-top: 24px;
+  padding: clamp(20px, 4vw, 32px);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  line-height: 1.5;
+}
+
+.forecast-card h2 { margin-bottom: 20px; }
+.forecast-card h3 { margin: 0 0 12px; color: var(--text-h); font-size: 1.1rem; }
+.forecast-series { margin-bottom: 20px; overflow-wrap: anywhere; }
+.forecast-series strong { color: var(--text-h); }
+.forecast-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 16px; align-items: end; }
+.forecast-form label { display: block; margin-bottom: 8px; color: var(--text-h); font-weight: 600; }
+.forecast-form select { box-sizing: border-box; width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-h); background: var(--bg); font: inherit; }
+.forecast-form .help-text { grid-column: 1 / -1; }
+.forecast-card button { padding: 10px 14px; border: 1px solid var(--accent-border); border-radius: 7px; background: var(--accent-bg); color: var(--text-h); font: inherit; cursor: pointer; }
+.forecast-card button:disabled, .forecast-form select:disabled { opacity: 0.65; cursor: default; }
+.forecast-card button:hover:not(:disabled) { border-color: var(--accent); }
+.forecast-card :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.forecast-message { margin: 20px 0; padding: 14px; border: 1px solid var(--accent-border); border-radius: 8px; background: var(--accent-bg); overflow-wrap: anywhere; }
+.forecast-message--error { color: var(--text-h); border-style: dashed; }
+.forecast-message--success { color: var(--text-h); }
+.forecast-results { margin-top: 28px; }
+.forecast-list-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.forecast-list-header h3 { margin: 0; }
+.forecast-table-wrap { max-width: 100%; overflow-x: auto; margin-top: 12px; }
+.forecast-table-wrap table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.forecast-table-wrap caption { text-align: left; margin-bottom: 10px; color: var(--text-h); font-weight: 600; }
+.forecast-table-wrap th, .forecast-table-wrap td { padding: 9px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+.forecast-table-wrap th { color: var(--text-h); white-space: nowrap; }
+.forecast-table-wrap td { min-width: 100px; }
+.forecast-table-wrap td:last-child { white-space: nowrap; }
+.forecast-explanation { margin-top: 8px; }

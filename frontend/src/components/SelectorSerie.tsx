@@ -17,9 +17,11 @@ type Props = {
   onStoreChange: (store: number | null) => void
   onFamilyChange: (family: string | null) => void
   onRetry: () => void
+  idPrefix?: string
 }
 
-function SelectorSerie({ state, selectedStore, selectedFamily, onStoreChange, onFamilyChange, onRetry }: Props) {
+function SelectorSerie({ state, selectedStore, selectedFamily, onStoreChange, onFamilyChange, onRetry, idPrefix = '' }: Props) {
+  const id = (nombre: string) => idPrefix ? `${idPrefix}-${nombre}` : nombre
   const series = state.kind === 'available' ? state.series : []
   const stores = [...new Set(series.map((serie) => serie.store_nbr))].sort((a, b) => a - b)
   const families = selectedStore === null ? [] : [
@@ -27,8 +29,8 @@ function SelectorSerie({ state, selectedStore, selectedFamily, onStoreChange, on
   ].sort((a, b) => a.localeCompare(b))
 
   return (
-    <section className="series-card" aria-labelledby="series-heading">
-      <h2 id="series-heading">Seleccionar serie temporal</h2>
+    <section className="series-card" aria-labelledby={id('series-heading')}>
+      <h2 id={id('series-heading')}>Seleccionar serie temporal</h2>
       <p className="series-intro">Elija una tienda y una familia del conjunto de datos activo.</p>
 
       {state.kind === 'loading' && <p role="status">Cargando series disponibles…</p>}
@@ -46,9 +48,9 @@ function SelectorSerie({ state, selectedStore, selectedFamily, onStoreChange, on
           <p className="series-count">Conjunto activo {state.conjuntoId} · {series.length} series disponibles</p>
           <div className="series-filters">
             <div>
-              <label htmlFor="series-store">Tienda</label>
+              <label htmlFor={id('series-store')}>Tienda</label>
               <select
-                id="series-store"
+                id={id('series-store')}
                 value={selectedStore ?? ''}
                 onChange={(event) => onStoreChange(event.target.value === '' ? null : Number(event.target.value))}
               >
@@ -57,9 +59,9 @@ function SelectorSerie({ state, selectedStore, selectedFamily, onStoreChange, on
               </select>
             </div>
             <div>
-              <label htmlFor="series-family">Familia de producto</label>
+              <label htmlFor={id('series-family')}>Familia de producto</label>
               <select
-                id="series-family"
+                id={id('series-family')}
                 value={selectedFamily ?? ''}
                 disabled={selectedStore === null}
                 onChange={(event) => onFamilyChange(event.target.value || null)}

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import HistoricoVentas from './components/HistoricoVentas'
+import PronosticosVentas from './components/PronosticosVentas'
 import SelectorSerie, { type SerieTemporal, type SeriesState } from './components/SelectorSerie'
 import './App.css'
 
@@ -408,7 +409,20 @@ function App() {
         />
       </section>
 
-      {vista !== 'datos' && vista !== 'historico' && (
+      <section className="app-view" aria-label="Pronósticos" hidden={vista !== 'pronosticos'}>
+        <SelectorSerie
+          idPrefix="pronosticos"
+          state={seriesState}
+          selectedStore={selectedStore}
+          selectedFamily={selectedFamily}
+          onStoreChange={handleStoreChange}
+          onFamilyChange={handleFamilyChange}
+          onRetry={handleRetrySeries}
+        />
+        <PronosticosVentas seleccion={seleccionHistorico} activo={vista === 'pronosticos'} />
+      </section>
+
+      {(vista === 'comparacion' || vista === 'simulacion') && (
         <section className="pending-view" aria-labelledby="pending-heading">
           <h2 id="pending-heading">{apartados.find((apartado) => apartado.id === vista)?.nombre}</h2>
           <p>Este apartado todavía no está disponible.</p>
