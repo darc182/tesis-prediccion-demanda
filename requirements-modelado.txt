@@ -1,0 +1,3 @@
+# Complementa el entorno actual de requirements.txt; no lo reemplaza.
+# Instalar dentro de .venv: python -m pip install -r requirements-modelado.txt
+scikit-learn==1.9.1
