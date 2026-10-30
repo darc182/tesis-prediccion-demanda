@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 'react'
 import type { SerieTemporal } from './SelectorSerie'
 
 type Seleccion = { conjuntoId: number; serie: SerieTemporal }
@@ -25,8 +25,15 @@ type EstadoDetalle = { kind: 'idle' } | { kind: 'loading'; id: number } |
 type EstadoGeneracion = { kind: 'idle' } | { kind: 'success' | 'error'; message: string }
 const DIA = 86_400_000
 // Formato de presentación; no se redondean ni reemplazan valores en el estado.
-const formatoVentas = new Intl.NumberFormat('es-EC', { maximumSignificantDigits: 17 })
+const formatoVentas = new Intl.NumberFormat('es-EC', { maximumFractionDigits: 3 })
+const formatoCientifico = new Intl.NumberFormat('es-EC', { notation: 'scientific', maximumFractionDigits: 3 })
 const formatoGeneracion = new Intl.DateTimeFormat('es-EC', { dateStyle: 'medium', timeStyle: 'short' })
+
+function presentarVenta(valor: number): string {
+  // Un positivo que se redondearía a cero conserva su orden de magnitud visible.
+  return valor !== 0 && (valor < 0.001 || valor >= 1_000_000_000)
+    ? formatoCientifico.format(valor) : formatoVentas.format(valor)
+}
 
 function registro(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -74,6 +81,67 @@ function esDetalle(value: unknown, seleccion: Seleccion, esperado: Referencia): 
 }
 function nombreTecnica(tecnica: Tecnica): string {
   return TECNICAS.find(t => t.id === tecnica)?.nombre ?? tecnica
+}
+
+function GraficoPronostico({ detalles, serie, pronostico }: {
+  detalles: Fila[]; serie: SerieTemporal; pronostico: Metadatos
+}) {
+  const id = useId()
+  const ancho = 760
+  const alto = 340
+  const izquierda = 122
+  const derecha = 48
+  const arriba = 24
+  const abajo = 66
+  const anchoGrafico = ancho - izquierda - derecha
+  const altoGrafico = alto - arriba - abajo
+  // Este componente solo recibe los quince detalles que ya superaron esDetalle.
+  const inicio = instanteFecha(detalles[0].fecha_objetivo) as number
+  const fin = instanteFecha(detalles[14].fecha_objetivo) as number
+  const maximoReal = detalles.reduce((maximo, fila) => Math.max(maximo, fila.venta_estimada), 0)
+  const maximo = maximoReal > 0 ? maximoReal : 1
+  const posicionX = (fecha: string) => izquierda +
+    ((instanteFecha(fecha) as number) - inicio) / (fin - inicio) * anchoGrafico
+  // Dividir antes de multiplicar evita desbordamientos con valores grandes.
+  // Con máximo positivo tampoco se resta un mínimo igual (casos constantes).
+  const posicionY = (valor: number) => arriba + (1 - valor / maximo) * altoGrafico
+  const marcasY = [...new Set([0, 0.25, 0.5, 0.75, 1].map(fraccion => maximo * fraccion))]
+  const marcasX = [0, 3, 7, 10, 14].map(indice => detalles[indice])
+  const puntos = detalles.map(fila => `${posicionX(fila.fecha_objetivo)},${posicionY(fila.venta_estimada)}`).join(' ')
+
+  return <figure className="forecast-chart">
+    <figcaption className="forecast-chart-caption">
+      <strong>Ventas diarias estimadas</strong>
+      <span>Tienda {serie.store_nbr} · {serie.family} · {nombreTecnica(pronostico.tecnica)}</span>
+      <span>Corte {pronostico.fecha_corte} · Periodo {detalles[0].fecha_objetivo} a {detalles[14].fecha_objetivo}</span>
+    </figcaption>
+    <div className="forecast-chart-scroll" tabIndex={0} role="region" aria-label="Gráfico de las quince ventas estimadas, desplazable horizontalmente">
+      <svg viewBox={`0 0 ${ancho} ${alto}`} role="img" aria-labelledby={`${id}-title ${id}-desc`}>
+        <title id={`${id}-title`}>Quince ventas diarias estimadas de la tienda {serie.store_nbr}, {serie.family}</title>
+        <desc id={`${id}-desc`}>
+          Eje horizontal: fecha objetivo. Eje vertical lineal desde cero: ventas estimadas.
+          La línea conecta los quince valores recibidos. Los ceros usan puntos huecos y los positivos rellenos.
+          La tabla inferior ofrece los mismos datos y permite consultar cada valor completo.
+        </desc>
+        {marcasY.map(valor => <g key={valor}>
+          <line x1={izquierda} x2={ancho - derecha} y1={posicionY(valor)} y2={posicionY(valor)} className="forecast-chart-grid" />
+          <text x={izquierda - 10} y={posicionY(valor) + 4} textAnchor="end" className="forecast-chart-label">{presentarVenta(valor)}</text>
+        </g>)}
+        <line x1={izquierda} x2={izquierda} y1={arriba} y2={alto - abajo} className="forecast-chart-axis" />
+        <line x1={izquierda} x2={ancho - derecha} y1={alto - abajo} y2={alto - abajo} className="forecast-chart-axis" />
+        {marcasX.map(fila => <text key={fila.paso} x={posicionX(fila.fecha_objetivo)} y={alto - abajo + 23}
+          textAnchor="middle" className="forecast-chart-label">{fila.fecha_objetivo}</text>)}
+        <text x={izquierda + anchoGrafico / 2} y={alto - 7} textAnchor="middle" className="forecast-chart-axis-title">Fecha objetivo</text>
+        <text transform={`translate(18 ${arriba + altoGrafico / 2}) rotate(-90)`} textAnchor="middle" className="forecast-chart-axis-title">Ventas estimadas</text>
+        <polyline points={puntos} className="forecast-chart-line" />
+        {detalles.map(fila => <circle key={fila.paso} cx={posicionX(fila.fecha_objetivo)} cy={posicionY(fila.venta_estimada)} r="4"
+          className={`forecast-chart-point${fila.venta_estimada === 0 ? ' forecast-chart-point--zero' : ''}`}>
+          <title>{fila.fecha_objetivo}: valor completo {String(fila.venta_estimada)}</title>
+        </circle>)}
+      </svg>
+    </div>
+    <p className="forecast-chart-note">Puntos huecos: estimación igual a cero. Puntos rellenos: valor positivo. Estimaciones basadas en ventas históricas.</p>
+  </figure>
 }
 
 class ErrorSolicitud extends Error {}
@@ -259,12 +327,20 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
         <p>Tienda {tienda} · {familia} · Corte {detalle.data.pronostico.fecha_corte}</p>
         <p>Periodo: {detalle.data.detalles[0].fecha_objetivo} a {detalle.data.detalles[14].fecha_objetivo}.</p>
         <p className="forecast-explanation">Estimaciones basadas en ventas históricas.</p>
+        <GraficoPronostico detalles={detalle.data.detalles} serie={detalle.data.serie} pronostico={detalle.data.pronostico} />
+        <p className="forecast-value-help">Se muestran hasta tres decimales o notación científica para magnitudes extremas. Abra «Valor completo» para consultar el número recibido.</p>
         <div className="forecast-table-wrap" tabIndex={0} role="region" aria-label="Quince estimaciones diarias">
           <table>
             <caption>Pronóstico diario de demanda</caption>
             <thead><tr><th scope="col">Paso</th><th scope="col">Fecha objetivo</th><th scope="col">Venta estimada</th></tr></thead>
             <tbody>{detalle.data.detalles.map(fila => <tr key={fila.paso}>
-              <td>{fila.paso}</td><td>{fila.fecha_objetivo}</td><td>{formatoVentas.format(fila.venta_estimada)}</td>
+              <td>{fila.paso}</td><td>{fila.fecha_objetivo}</td><td>
+                <span>{presentarVenta(fila.venta_estimada)}</span>
+                {fila.venta_estimada !== 0 && <details className="forecast-value-details">
+                  <summary aria-label={`Valor completo del paso ${fila.paso}`}>Valor completo</summary>
+                  <span>{String(fila.venta_estimada)}</span>
+                </details>}
+              </td>
             </tr>)}</tbody>
           </table>
         </div>

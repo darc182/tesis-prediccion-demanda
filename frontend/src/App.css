@@ -521,3 +521,100 @@
 .forecast-table-wrap td { min-width: 100px; }
 .forecast-table-wrap td:last-child { white-space: nowrap; }
 .forecast-explanation { margin-top: 8px; }
+
+.forecast-chart {
+  margin: 24px 0;
+}
+
+.forecast-chart-caption {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 16px;
+  overflow-wrap: anywhere;
+}
+
+.forecast-chart-caption strong {
+  color: var(--text-h);
+}
+
+.forecast-chart-caption span,
+.forecast-chart-note,
+.forecast-value-help {
+  font-size: 0.88rem;
+}
+
+.forecast-chart-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.forecast-chart-scroll svg {
+  display: block;
+  width: 100%;
+  min-width: 640px;
+  height: auto;
+}
+
+.forecast-chart-grid {
+  stroke: var(--border);
+}
+
+.forecast-chart-axis {
+  stroke: var(--text);
+}
+
+.forecast-chart-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.forecast-chart-point {
+  fill: var(--accent);
+  stroke: var(--bg);
+  stroke-width: 1;
+}
+
+.forecast-chart-point--zero {
+  fill: var(--bg);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.forecast-chart-label,
+.forecast-chart-axis-title {
+  fill: var(--text-h);
+  font-size: 14px;
+}
+
+.forecast-chart-axis-title {
+  font-weight: 600;
+}
+
+.forecast-chart-note {
+  margin-top: 12px;
+}
+
+.forecast-value-details {
+  margin-top: 6px;
+  font-size: 0.82rem;
+}
+
+.forecast-value-details summary {
+  width: fit-content;
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.forecast-value-details span {
+  display: block;
+  max-width: 28ch;
+  margin-top: 6px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: var(--text-h);
+  font-family: var(--mono);
+}
