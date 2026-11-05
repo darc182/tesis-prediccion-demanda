@@ -208,6 +208,16 @@ def _leer_detalles(conexion, pronostico_id):
     ).fetchall()
 
 
+def _contenido_config(config):
+    """Comparación determinista del JSON completo de F1, sin persistir otra identidad.
+
+    Ignora espacios y orden de claves; conserva valores y orden de listas.
+    Incluye auditoría, versiones e histórico tal como se registraban en HU004.
+    """
+    return json.dumps(config, ensure_ascii=False, sort_keys=True, allow_nan=False,
+                      separators=(",", ":"))
+
+
 def _buscar_identico(conexion, serie_id, tecnica, corte, config, inicio, fin, detalles):
     existentes = conexion.execute(
         "SELECT e.id, p.id, e.configuracion_json, e.inicio_entrenamiento, "
@@ -216,21 +226,34 @@ def _buscar_identico(conexion, serie_id, tecnica, corte, config, inicio, fin, de
         "WHERE e.serie_id = ? AND e.tecnica = ? AND p.fecha_corte = ? AND p.tipo = ?",
         (serie_id, tecnica, corte.isoformat(), "validacion"),
     ).fetchall()
-    if not existentes:
-        return None
-    if len(existentes) == 1:
-        e, p, texto, inicio_guardado, fin_guardado, ruta_modelo, horizonte = existentes[0]
+    contenido = _contenido_config(config)
+    coincidencias = []
+    for fila in existentes:
         try:
-            misma_config = json.loads(texto) == config
+            misma_config = _contenido_config(json.loads(fila[2])) == contenido
         except (ValueError, TypeError):
-            misma_config = False
-        guardados = _leer_detalles(conexion, p)
-        # La hora de generación y la duración medida difieren entre ejecuciones;
-        # no son parámetros ni valores del resultado a comparar.
-        if (misma_config and inicio_guardado == inicio and fin_guardado == fin
-                and ruta_modelo is None and horizonte == HORIZONTE_DIAS and guardados == detalles):
-            return e, p
-    raise ErrorRegistroPronostico("conflicto", "Ya existe un pronóstico conflictivo o incompleto para esta serie, técnica, corte y tipo.")
+            raise ErrorRegistroPronostico(
+                "conflicto", "No se puede determinar la configuración de un pronóstico almacenado.")
+        if misma_config:
+            coincidencias.append(fila)
+    if not coincidencias:
+        return None
+    # No elegir arbitrariamente ni siquiera si uno de los duplicados coincide.
+    if len(coincidencias) != 1:
+        raise ErrorRegistroPronostico(
+            "conflicto", "Existen varios pronósticos ambiguos con la misma configuración.")
+    e, p, _, inicio_guardado, fin_guardado, ruta_modelo, horizonte = coincidencias[0]
+    guardados = _leer_detalles(conexion, p)
+    if len(guardados) != HORIZONTE_DIAS:
+        raise ErrorRegistroPronostico(
+            "conflicto", "Error de integridad: pronóstico incompleto para la misma configuración.")
+    # La hora de generación y la duración medida difieren entre ejecuciones;
+    # no son parámetros ni valores del resultado a comparar.
+    if (inicio_guardado == inicio and fin_guardado == fin and ruta_modelo is None
+            and horizonte == HORIZONTE_DIAS and guardados == detalles):
+        return e, p
+    raise ErrorRegistroPronostico(
+        "conflicto", "Ya existe un pronóstico conflictivo para la misma configuración.")
 
 
 def registrar_pronostico(
