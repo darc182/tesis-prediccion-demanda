@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 import json
+import pandas as pd
 from pathlib import Path
 import tempfile
 from threading import Barrier
@@ -48,8 +49,9 @@ class RegistroPronosticosTests(unittest.TestCase):
         with closing(conectar(self.ruta)) as c, c:
             return c.execute(sql, parametros).fetchall()
 
-    def registrar(self, tecnica=BASE, corte=CORTE, serie=83):
-        return registro.registrar_pronostico(self.ruta, serie, tecnica, corte)
+    def registrar(self, tecnica=BASE, corte=CORTE, serie=83, *, configuracion_solicitada=None):
+        argumentos = {} if configuracion_solicitada is None else {"configuracion_solicitada": configuracion_solicitada}
+        return registro.registrar_pronostico(self.ruta, serie, tecnica, corte, **argumentos)
 
     def conteos(self):
         return tuple(self.consultar(f"SELECT COUNT(*) FROM {t}")[0][0]
@@ -116,6 +118,172 @@ class RegistroPronosticosTests(unittest.TestCase):
 
     def test_registro_hist_gradient_boosting_real(self):
         self.comprobar_regresor("hist_gradient_boosting")
+
+    def registrar_cuatro_reales(self):
+        """Integración F3: cuatro entrenamientos reales, sin dobles del cálculo."""
+        casos = [
+            ("random_forest", None),
+            ("random_forest", {"tecnica": "random_forest", "parametros": {
+                "n_estimators": 200, "max_depth": 4, "random_state": 7}}),
+            ("hist_gradient_boosting", None),
+            ("hist_gradient_boosting", {"tecnica": "hist_gradient_boosting", "parametros": {
+                "max_iter": 150, "learning_rate": 0.1, "l2_regularization": 0.5, "random_state": 11}}),
+        ]
+        return [(t, c, self.registrar(t, configuracion_solicitada=c)) for t, c in casos]
+
+    def test_cuatro_experimentos_reales_coexisten_se_consultan_y_reutilizan_sin_escribir(self):
+        historicos = self.historicos()
+        casos = self.registrar_cuatro_reales()
+        self.assertTrue(all(r.nuevo for _, _, r in casos))
+        self.assertEqual(len({r.experimento_id for _, _, r in casos}), 4)
+        self.assertEqual(len({r.pronostico_id for _, _, r in casos}), 4)
+        self.assertEqual(self.conteos(), (4, 4, 60, 0, 0))
+        consultas = {}
+        textos = {}
+        for tecnica, solicitud, r in casos:
+            consulta = consultar_pronostico(self.ruta, r.pronostico_id)
+            consultas[r.pronostico_id] = consulta
+            self.assertEqual(consulta["pronostico"]["experimento_id"], r.experimento_id)
+            self.assertEqual(len(consulta["detalles"]), 15)
+            texto = self.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (r.experimento_id,))[0][0]
+            textos[r.experimento_id] = texto
+            c = json.loads(texto)
+            efectiva = configuracion.normalizar_configuracion({"tecnica": tecnica} if solicitud is None else solicitud)
+            self.assertEqual(c["version_registro"], 2)
+            self.assertEqual(c["configuracion_predictiva"], efectiva)
+            self.assertEqual(c["parametros"], efectiva["parametros"])
+            # Segundo entrenamiento REAL e independiente: contrasta JSON y resultados almacenados.
+            datos = pd.DataFrame(self.filas, columns=["date", "sales", "onpromotion"])
+            datos["store_nbr"], datos["family"] = 17, "PREPARED FOODS"
+            m = modelos.entrenar_modelo(datos, 17, "PREPARED FOODS", tecnica, CORTE,
+                                        configuracion_solicitada=solicitud)
+            self.assertEqual(json.dumps(c["parametros"], sort_keys=True),
+                             json.dumps(m.estimador.get_params(deep=False), sort_keys=True))
+            if tecnica == "random_forest":
+                self.assertEqual(len(m.estimador.estimators_), c["parametros"]["n_estimators"])
+            else:
+                self.assertEqual(m.estimador.n_iter_, c["parametros"]["max_iter"])
+            predicciones = modelos.pronosticar_recursivo(m, datos)
+            self.assertEqual([d["venta_estimada"] for d in consulta["detalles"]],
+                             [p.venta_estimada for p in predicciones])
+        contenido = self.ruta.read_bytes()
+        sentencias = []
+        abrir = registro._abrir_base
+
+        def observar(*args, **kwargs):
+            c = abrir(*args, **kwargs)
+            c.set_trace_callback(sentencias.append)
+            return c
+
+        with patch.object(registro, "_abrir_base", side_effect=observar):
+            for tecnica, solicitud, r in reversed(casos):
+                repetido = self.registrar(tecnica, configuracion_solicitada=solicitud)
+                self.assertTrue(repetido.reutilizado)
+                self.assertEqual((repetido.experimento_id, repetido.pronostico_id), (r.experimento_id, r.pronostico_id))
+        self.assertFalse(any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) for s in sentencias))
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual({p["id"] for p in listar_pronosticos(self.ruta, 83)["pronosticos"]}, set(consultas))
+        for _, _, r in casos:
+            self.assertEqual(consultar_pronostico(self.ruta, r.pronostico_id), consultas[r.pronostico_id])
+            self.assertEqual(self.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (r.experimento_id,))[0][0],
+                             textos[r.experimento_id])
+        self.assertEqual(self.historicos(), historicos)
+        self.assertEqual(self.consultar("PRAGMA foreign_key_check"), [])
+
+    def test_configuraciones_invalidas_no_calculan_ni_insertan(self):
+        self.registrar()
+        contenido = self.ruta.read_bytes()
+        casos = [
+            ("random_forest", {"tecnica": "hist_gradient_boosting"}),
+            ("random_forest", {"tecnica": "random_forest", "parametros": {"n_estimators": True}}),
+            ("random_forest", {"tecnica": "random_forest", "parametros": {"n_estimators": 501}}),
+            ("random_forest", {"tecnica": "random_forest", "parametros": {"n_jobs": 2}}),
+            ("random_forest", {"tecnica": "random_forest", "parametros": {"otro": 3}}),
+            ("random_forest", {"tecnica": "random_forest", "variables": list(reversed(configuracion.VARIABLES))}),
+            ("random_forest", {"tecnica": "random_forest", "variables": list(configuracion.VARIABLES[:-1])}),
+            ("random_forest", {"tecnica": "random_forest", "variables": [*configuracion.VARIABLES, "onpromotion"]}),
+            ("hist_gradient_boosting", {"tecnica": "hist_gradient_boosting", "parametros": {"early_stopping": True}}),
+            ("hist_gradient_boosting", {"tecnica": "hist_gradient_boosting", "parametros": {"learning_rate": float("inf")}}),
+            (BASE, {"tecnica": BASE, "parametros": {"periodo_estacional_dias": 14}}),
+        ]
+        with patch.object(registro, "_calcular") as calcular, patch.object(registro, "_abrir_base") as abrir:
+            for tecnica, solicitud in casos:
+                with self.subTest(solicitud=solicitud), self.assertRaises(registro.ErrorRegistroPronostico) as error:
+                    self.registrar(tecnica, configuracion_solicitada=solicitud)
+                self.assertEqual(error.exception.codigo, "error_calculo")
+            calcular.assert_not_called()
+            abrir.assert_not_called()
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
+
+    def test_linea_base_opcional_explicita_sigue_siendo_la_original(self):
+        anterior = self.registrar()
+        contenido = self.ruta.read_bytes()
+        repetido = self.registrar(configuracion_solicitada={"tecnica": BASE})
+        self.assertTrue(repetido.reutilizado)
+        self.assertEqual(repetido.pronostico_id, anterior.pronostico_id)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_alternativo_real_reutiliza_formato_antiguo_sin_migrarlo(self):
+        t = "random_forest"
+        solicitud = {"tecnica": t, "parametros": {"n_estimators": 30, "max_depth": 3}}
+        r = self.registrar(t, configuracion_solicitada=solicitud)
+        self.convertir_a_formato_antiguo(r.experimento_id)
+        contenido = self.ruta.read_bytes()
+        repetido = self.registrar(t, configuracion_solicitada=solicitud)
+        self.assertTrue(repetido.reutilizado)
+        self.assertEqual(repetido.pronostico_id, r.pronostico_id)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_fallo_persistencia_alternativa_real_preserva_default(self):
+        t = "random_forest"
+        r = self.registrar(t)
+        consulta = consultar_pronostico(self.ruta, r.pronostico_id)
+        historicos = self.historicos()
+        self.consultar("CREATE TRIGGER fallo BEFORE INSERT ON detalle_pronostico WHEN NEW.paso=8 "
+                       "BEGIN SELECT RAISE(ABORT,'fallo alternativa real'); END")
+        contenido = self.ruta.read_bytes()
+        with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "fallo alternativa real") as error:
+            self.registrar(t, configuracion_solicitada={"tecnica": t, "parametros": {"n_estimators": 30}})
+        self.assertEqual(error.exception.codigo, "error_persistencia")
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(consultar_pronostico(self.ruta, r.pronostico_id), consulta)
+        self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
+        self.assertEqual(self.historicos(), historicos)
+        self.assertEqual(self.consultar("PRAGMA foreign_key_check"), [])
+
+    def test_no_registra_alternativa_si_estimador_ignora_solicitud(self):
+        t = "random_forest"
+        self.registrar(t)
+        crear = modelos.crear_estimador
+        contenido = self.ruta.read_bytes()
+
+        def ignorar(tecnica, **kwargs):
+            return crear(tecnica)
+
+        with patch.object(modelos, "crear_estimador", side_effect=ignorar):
+            with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "parámetros reales"):
+                self.registrar(t, configuracion_solicitada={"tecnica": t, "parametros": {"n_estimators": 30}})
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
+
+    def test_concurrencia_de_alternativa_real_no_duplica(self):
+        t = "random_forest"
+        solicitud = {"tecnica": t, "parametros": {"n_estimators": 30, "random_state": 7}}
+        barrera = Barrier(2)
+        calcular = registro._calcular
+
+        def sincronizar(*args, **kwargs):
+            resultado = calcular(*args, **kwargs)  # fit real; solo sincronizamos la llegada al registro
+            barrera.wait(timeout=20)
+            return resultado
+
+        with patch.object(registro, "_calcular", side_effect=sincronizar), ThreadPoolExecutor(max_workers=2) as ejecutor:
+            futuros = [ejecutor.submit(self.registrar, t, configuracion_solicitada=solicitud) for _ in range(2)]
+            resultados = [f.result(timeout=30) for f in futuros]
+        self.assertEqual(sorted(r.nuevo for r in resultados), [False, True])
+        self.assertEqual(len({(r.experimento_id, r.pronostico_id) for r in resultados}), 1)
+        self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
 
     def test_rechaza_serie_inactiva(self):
         with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "conjunto activo"):
@@ -369,7 +537,7 @@ class RegistroPronosticosTests(unittest.TestCase):
 
             contenido = self.ruta.read_bytes()
             with self.subTest(cambio=cambio), patch.object(modelos, "crear_estimador", side_effect=cambiar):
-                with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "defaults del contrato"):
+                with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "configuración solicitada"):
                     self.registrar("random_forest")
             self.assertEqual(self.ruta.read_bytes(), contenido)
         self.assertEqual(self.conteos(), (0, 0, 0, 0, 0))
@@ -614,18 +782,20 @@ class RegistroPronosticosTests(unittest.TestCase):
             self.assertEqual(c.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             return c
 
-        def entrenar_sin_bloqueo(*args):
+        def entrenar_sin_bloqueo(*args, **kwargs):
             eventos.append("entrenar")
             # Una conexión independiente puede reservar escritura durante fit.
             with closing(conectar(self.ruta)) as c:
                 c.execute("BEGIN IMMEDIATE")
                 c.rollback()
-            return entrenar(*args)
+            return entrenar(*args, **kwargs)
 
         with patch.object(registro, "_abrir_base", side_effect=observar), \
                 patch.object(modelos, "entrenar_modelo", side_effect=entrenar_sin_bloqueo):
             self.registrar("random_forest")
-        self.assertEqual(eventos, ["entrenar", "abrir_escritura"])
+            self.registrar("random_forest", configuracion_solicitada={
+                "tecnica": "random_forest", "parametros": {"n_estimators": 30}})
+        self.assertEqual(eventos, ["entrenar", "abrir_escritura", "entrenar", "abrir_escritura"])
 
     def test_recomprueba_activo_justo_antes_de_guardar(self):
         calcular = registro._calcular

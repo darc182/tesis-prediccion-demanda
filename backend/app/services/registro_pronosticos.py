@@ -127,7 +127,8 @@ def _leer_instantanea(conexion: sqlite3.Connection, serie_id: int, corte: date) 
     return _Instantanea(activo[0], activo[1], serie_id, serie[1], serie[2], filas)
 
 
-def _calcular(instantanea: _Instantanea, tecnica: str, corte: date):
+def _calcular(instantanea: _Instantanea, tecnica: str, corte: date,
+              *, configuracion_solicitada: dict | None = None):
     """Adaptador a los scripts existentes: sin SQL ni lógica predictiva propia."""
     datos = pd.DataFrame(instantanea.filas, columns=["date", "sales", "onpromotion"])
     datos["store_nbr"] = instantanea.store_nbr
@@ -145,7 +146,11 @@ def _calcular(instantanea: _Instantanea, tecnica: str, corte: date):
     else:
         # Importación diferida: la línea base no necesita cargar scikit-learn.
         from scripts import modelos_prediccion as modelos
-        modelo = modelos.entrenar_modelo(datos, instantanea.store_nbr, instantanea.family, tecnica, corte)
+        efectiva = modelos.normalizar_configuracion_entrenamiento(tecnica, configuracion_solicitada)
+        argumentos = {} if configuracion_solicitada is None else {"configuracion_solicitada": efectiva}
+        modelo = modelos.entrenar_modelo(
+            datos, instantanea.store_nbr, instantanea.family, tecnica, corte, **argumentos)
+        modelos.comprobar_parametros_efectivos(modelo.estimador, efectiva)
         predicciones = modelos.pronosticar_recursivo(modelo, datos)
         parametros = modelo.estimador.get_params(deep=False)
         if tuple(modelos.COLUMNAS_PREDICTORAS) != configuracion.VARIABLES:
@@ -161,8 +166,9 @@ def _calcular(instantanea: _Instantanea, tecnica: str, corte: date):
                                       allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
     predictiva = configuracion.normalizar_configuracion({"tecnica": tecnica, "parametros": parametros})
     if configuracion.json_canonico(predictiva) != configuracion.json_canonico(
-            configuracion.configuracion_predeterminada(tecnica)):
-        raise ValueError("Los parámetros reales no corresponden a los defaults del contrato.")
+            configuracion.normalizar_configuracion(
+                {"tecnica": tecnica} if configuracion_solicitada is None else configuracion_solicitada)):
+        raise ValueError("Los parámetros reales no corresponden a la configuración solicitada.")
     config = {"version_registro": 2, "configuracion_predictiva": predictiva,
               "tecnica": tecnica, "parametros": parametros,
               "reglas": reglas, "versiones": versiones, "entrenamiento": entrenamiento,
@@ -257,13 +263,26 @@ def _buscar_identico(conexion, serie_id, tecnica, corte, config, inicio, fin, de
 
 def registrar_pronostico(
     ruta_base: str | Path, serie_id: int, tecnica: str, fecha_corte: date | str,
+    *, configuracion_solicitada: dict | None = None,
 ) -> ResultadoRegistro:
     """Genera antes del bloqueo; registra o reutiliza una validación completa.
 
     Lanza ErrorRegistroPronostico con código y mensaje ante rechazo o fallo.
+    configuracion_solicitada es un objeto F2 parcial o completo, solo por palabra
+    clave. None conserva HU004. La API HTTP actual no expone este argumento.
     No se inicia ninguna operación por importar este módulo.
     """
     corte = _validar_solicitud(serie_id, tecnica, fecha_corte)
+    try:
+        efectiva = configuracion.normalizar_configuracion(
+            {"tecnica": tecnica} if configuracion_solicitada is None else configuracion_solicitada)
+        if efectiva["tecnica"] != tecnica:
+            raise ValueError("La técnica de la configuración no coincide con la solicitada.")
+        variables = [] if tecnica == linea_base.TECNICA else list(configuracion.VARIABLES)
+        if efectiva["variables"] != variables:
+            raise ValueError("F3 requiere las variables originales en su orden original.")
+    except (ValueError, TypeError) as error:
+        raise ErrorRegistroPronostico("error_calculo", f"Configuración inválida: {error}") from error
     ruta = Path(ruta_base)
     try:
         with closing(_abrir_base(ruta)) as conexion:
@@ -274,11 +293,15 @@ def registrar_pronostico(
 
     inicio_calculo = perf_counter()
     try:
-        predicciones, config, inicio, fin = _calcular(instantanea, tecnica, corte)
+        argumentos = {} if configuracion_solicitada is None else {"configuracion_solicitada": efectiva}
+        predicciones, config, inicio, fin = _calcular(instantanea, tecnica, corte, **argumentos)
         detalles = _validar_predicciones(predicciones, instantanea, tecnica, corte)
         if not isinstance(config, dict) or config.get("tecnica") != tecnica:
             raise ErrorRegistroPronostico("resultado_invalido", "La configuración no corresponde a la técnica solicitada.")
         _contenido_config(config)  # validar antes del bloqueo, también al primer registro
+        if (configuracion_solicitada is not None
+                and _contenido_config(config) != configuracion.identidad_configuracion(efectiva)):
+            raise ErrorRegistroPronostico("resultado_invalido", "La configuración calculada no corresponde a la solicitada.")
         texto_config = json.dumps(config, ensure_ascii=False, sort_keys=True, allow_nan=False)
     except ErrorRegistroPronostico:
         raise

@@ -1,6 +1,8 @@
 """Pruebas temporales con regresores reales pequeños y estimadores simulados."""
 
 from datetime import date, timedelta
+from copy import deepcopy
+import json
 from math import isfinite
 from pathlib import Path
 import tempfile
@@ -11,6 +13,7 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 
 from scripts import modelos_prediccion as modelos
+from backend.app.services import configuracion_experimentos as configuracion
 from scripts.preparar_series_modelado import leer_configuracion
 from scripts.variables_predictoras import COLUMNAS_PREDICTORAS, construir_variables_futuras
 
@@ -59,6 +62,17 @@ class ModelosPrediccionTests(unittest.TestCase):
         cls.datos = observaciones()
         cls.entrenados = {t: modelos.entrenar_modelo(cls.datos, 1, "A", t, CORTE)
                           for t in modelos.TECNICAS}
+        cls.solicitudes = {
+            "random_forest": {"tecnica": "random_forest", "parametros": {
+                "n_estimators": 200, "max_depth": 4, "min_samples_leaf": 2,
+                "min_samples_split": 4, "max_leaf_nodes": 12, "max_features": "sqrt", "random_state": 7}},
+            "hist_gradient_boosting": {"tecnica": "hist_gradient_boosting", "parametros": {
+                "max_iter": 150, "learning_rate": 0.1, "max_depth": 3, "max_leaf_nodes": 7,
+                "min_samples_leaf": 5, "l2_regularization": 0.5, "max_features": 0.8, "random_state": 11}},
+        }
+        cls.alternativos = {t: modelos.entrenar_modelo(cls.datos, 1, "A", t, CORTE,
+                                                      configuracion_solicitada=cls.solicitudes[t])
+                            for t in modelos.TECNICAS}
 
     def test_random_forest_con_seis_variables(self):
         m = self.entrenados["random_forest"]
@@ -80,6 +94,163 @@ class ModelosPrediccionTests(unittest.TestCase):
         for tecnica, parametros in zip(modelos.TECNICAS, (esperado_rf, esperado_hgb)):
             actual = self.entrenados[tecnica].estimador.get_params()
             self.assertEqual({k: actual[k] for k in parametros}, parametros)
+
+    def test_random_forest_alternativo_entrena_200_arboles_con_parametros_solicitados(self):
+        m = self.alternativos["random_forest"]
+        self.assertIsInstance(m.estimador, RandomForestRegressor)
+        self.assertEqual(len(m.estimador.estimators_), 200)
+        for nombre, valor in self.solicitudes["random_forest"]["parametros"].items():
+            self.assertEqual(m.estimador.get_params()[nombre], valor)
+        self.assertEqual(m.estimador.n_jobs, 1)
+        self.assertTrue(all(a.get_depth() <= 4 for a in m.estimador.estimators_))
+
+    def test_hist_gradient_boosting_alternativo_entrena_150_iteraciones_y_regularizacion(self):
+        m = self.alternativos["hist_gradient_boosting"]
+        self.assertIsInstance(m.estimador, HistGradientBoostingRegressor)
+        self.assertEqual(m.estimador.n_iter_, 150)
+        for nombre, valor in self.solicitudes["hist_gradient_boosting"]["parametros"].items():
+            self.assertEqual(m.estimador.get_params()[nombre], valor)
+        self.assertIs(m.estimador.early_stopping, False)
+
+    def test_get_params_completo_coincide_con_contrato_en_modelos_realmente_entrenados(self):
+        for t, m in self.alternativos.items():
+            esperado = configuracion.normalizar_configuracion(self.solicitudes[t])["parametros"]
+            self.assertEqual(json.dumps(m.estimador.get_params(deep=False), sort_keys=True),
+                             json.dumps(esperado, sort_keys=True))
+            self.assertEqual(tuple(m.estimador.feature_names_in_), COLUMNAS_PREDICTORAS)
+            self.assertEqual((m.filas_validas, m.filas_descartadas, m.ultima_fecha_entrenamiento),
+                             (46, 14, CORTE))
+            self.assertIsNot(m.estimador, self.entrenados[t].estimador)
+
+    def test_defaults_explicitos_conservan_resultados_originales(self):
+        for t, anterior in self.entrenados.items():
+            with self.subTest(tecnica=t):
+                actual = modelos.entrenar_modelo(self.datos, 1, "A", t, CORTE,
+                    configuracion_solicitada=configuracion.configuracion_predeterminada(t))
+                self.assertEqual(modelos.pronosticar_recursivo(actual, self.datos),
+                                 modelos.pronosticar_recursivo(anterior, self.datos))
+
+    def test_defaults_coinciden_con_los_constructores_originales_anteriores_a_f3(self):
+        originales = {
+            "random_forest": RandomForestRegressor(n_estimators=100, min_samples_leaf=5, random_state=42, n_jobs=1),
+            "hist_gradient_boosting": HistGradientBoostingRegressor(max_iter=100, learning_rate=0.05,
+                max_leaf_nodes=15, min_samples_leaf=20, early_stopping=False, random_state=42),
+        }
+        tabla = modelos.construir_tabla_serie(self.datos, 1, "A", CORTE).tabla
+        for t, estimador in originales.items():
+            with self.subTest(tecnica=t):
+                self.assertEqual(json.dumps(estimador.get_params(deep=False), sort_keys=True),
+                                 json.dumps(self.entrenados[t].estimador.get_params(deep=False), sort_keys=True))
+                with modelos.threadpool_limits(limits=1):
+                    estimador.fit(tabla.loc[:, list(COLUMNAS_PREDICTORAS)], tabla["sales"])
+                anterior = modelos.ModeloEntrenado(1, "A", t, CORTE, estimador, 46, 14, CORTE, 0.0)
+                self.assertEqual(modelos.pronosticar_recursivo(anterior, self.datos),
+                                 modelos.pronosticar_recursivo(self.entrenados[t], self.datos))
+
+    def test_configuracion_alternativa_es_determinista_y_no_comparte_instancia(self):
+        for t, anterior in self.alternativos.items():
+            with self.subTest(tecnica=t):
+                actual = modelos.entrenar_modelo(self.datos, 1, "A", t, CORTE,
+                                                 configuracion_solicitada=self.solicitudes[t])
+                self.assertIsNot(actual.estimador, anterior.estimador)
+                self.assertEqual(modelos.pronosticar_recursivo(actual, self.datos),
+                                 modelos.pronosticar_recursivo(anterior, self.datos))
+
+    def test_alternativos_generan_quince_fracciones_finitas_con_variables_originales_y_recursion(self):
+        original = construir_variables_futuras
+        for t, m in self.alternativos.items():
+            consultas = []
+
+            def observar(historial, tienda, familia, corte, objetivo, previas):
+                x = original(historial, tienda, familia, corte, objetivo, previas)
+                self.assertEqual(tuple(x.columns), COLUMNAS_PREDICTORAS)
+                self.assertNotIn("onpromotion", x.columns)
+                consultas.append(dict(previas))
+                return x
+
+            with self.subTest(tecnica=t), patch.object(modelos, "construir_variables_futuras", side_effect=observar):
+                p = modelos.pronosticar_recursivo(m, self.datos)
+            self.assertEqual([v.fecha_objetivo for v in p], [CORTE + timedelta(days=i) for i in range(1, 16)])
+            self.assertEqual([v.paso for v in p], list(range(1, 16)))
+            self.assertTrue(all(isfinite(v.venta_estimada) and v.venta_estimada >= 0 for v in p))
+            self.assertTrue(any(v.venta_estimada != int(v.venta_estimada) for v in p))
+            self.assertEqual([len(v) for v in consultas], list(range(15)))
+            self.assertEqual(consultas[-1], {v.fecha_objetivo: v.venta_estimada for v in p[:-1]})
+
+    def test_alternativos_ignoran_ventas_y_promociones_futuras_sin_modificar_dataframe(self):
+        for t, anterior in self.alternativos.items():
+            with self.subTest(tecnica=t):
+                entrada = con_futuro(self.datos, "NO_LEER_VENTAS")
+                entrada["onpromotion"] = entrada["onpromotion"].astype(object)
+                entrada.loc[entrada["date"] > CORTE.isoformat(), "onpromotion"] = "NO_LEER_PROMOCIONES"
+                copia = entrada.copy(deep=True)
+                solicitud = deepcopy(self.solicitudes[t])
+                actual = modelos.entrenar_modelo(entrada, 1, "A", t, CORTE,
+                                                 configuracion_solicitada=solicitud)
+                self.assertEqual(modelos.pronosticar_recursivo(actual, entrada),
+                                 modelos.pronosticar_recursivo(anterior, self.datos))
+                self.assertEqual(actual.ultima_fecha_entrenamiento, CORTE)
+                pd.testing.assert_frame_equal(entrada, copia)
+                self.assertEqual(solicitud, self.solicitudes[t])
+
+    def test_configuraciones_invalidas_se_rechazan_antes_de_preparar_o_entrenar(self):
+        casos = [
+            {"tecnica": "random_forest", "parametros": {"n_estimators": True}},
+            {"tecnica": "random_forest", "parametros": {"n_jobs": 2}},
+            {"tecnica": "random_forest", "parametros": {"desconocido": 1}},
+            {"tecnica": "random_forest", "parametros": {"max_depth": -1}},
+            {"tecnica": "hist_gradient_boosting"},
+            {"tecnica": "random_forest", "variables": list(reversed(COLUMNAS_PREDICTORAS))},
+            {"tecnica": "random_forest", "variables": list(COLUMNAS_PREDICTORAS[:-1])},
+            {"tecnica": "random_forest", "variables": [*COLUMNAS_PREDICTORAS, "onpromotion"]},
+        ]
+        with patch.object(modelos, "construir_tabla_serie") as preparar, \
+                patch.object(RandomForestRegressor, "fit") as ajustar:
+            for solicitud in casos:
+                with self.subTest(solicitud=solicitud), self.assertRaises(ValueError):
+                    modelos.entrenar_modelo(self.datos, 1, "A", "random_forest", CORTE,
+                                            configuracion_solicitada=solicitud)
+                with self.assertRaises(ValueError):
+                    modelos.crear_estimador("random_forest", configuracion_solicitada=solicitud)
+            preparar.assert_not_called()
+            ajustar.assert_not_called()
+        for parametros in ({"early_stopping": True}, {"learning_rate": float("nan")}, {"max_iter": 501}):
+            with patch.object(HistGradientBoostingRegressor, "fit") as ajustar, self.assertRaises(ValueError):
+                modelos.entrenar_modelo(self.datos, 1, "A", "hist_gradient_boosting", CORTE,
+                    configuracion_solicitada={"tecnica": "hist_gradient_boosting", "parametros": parametros})
+            ajustar.assert_not_called()
+
+    def test_comprobacion_efectiva_distingue_numero_y_fraccion_max_features(self):
+        t = "random_forest"
+        entera = {"tecnica": t, "parametros": {"n_estimators": 20, "max_features": 1}}
+        fraccion = {"tecnica": t, "parametros": {"n_estimators": 20, "max_features": 1.0}}
+        a = modelos.entrenar_modelo(self.datos, 1, "A", t, CORTE, configuracion_solicitada=entera)
+        b = modelos.entrenar_modelo(self.datos, 1, "A", t, CORTE, configuracion_solicitada=fraccion)
+        self.assertIs(type(a.estimador.max_features), int)
+        self.assertIs(type(b.estimador.max_features), float)
+        with self.assertRaisesRegex(ValueError, "parámetros reales"):
+            modelos.comprobar_parametros_efectivos(a.estimador, configuracion.normalizar_configuracion(fraccion))
+
+    def test_no_entrena_si_constructor_ignora_parametros_solicitados(self):
+        t = "random_forest"
+        with patch.object(modelos, "crear_estimador", return_value=RandomForestRegressor(
+                n_estimators=100, min_samples_leaf=5, random_state=42, n_jobs=1)), \
+                patch.object(RandomForestRegressor, "fit") as ajustar:
+            with self.assertRaisesRegex(ValueError, "parámetros reales"):
+                modelos.entrenar_modelo(self.datos, 1, "A", t, CORTE,
+                    configuracion_solicitada={"tecnica": t, "parametros": {"n_estimators": 200}})
+            ajustar.assert_not_called()
+
+    def test_alternativos_mantienen_limite_de_un_hilo_en_fit_y_prediccion(self):
+        limitar = modelos.threadpool_limits
+        for t, parametros in (("random_forest", {"n_estimators": 20}),
+                               ("hist_gradient_boosting", {"max_iter": 20})):
+            with self.subTest(tecnica=t), patch.object(modelos, "threadpool_limits", wraps=limitar) as limites:
+                m = modelos.entrenar_modelo(self.datos, 1, "A", t, CORTE,
+                    configuracion_solicitada={"tecnica": t, "parametros": parametros})
+                modelos.pronosticar_recursivo(m, self.datos)
+            self.assertEqual(len(limites.call_args_list), 2)
+            self.assertTrue(all(c.kwargs == {"limits": 1} for c in limites.call_args_list))
 
     def test_entrenamiento_independiente_por_tienda_familia_y_tecnica(self):
         claves = ((1, "A"), (1, "B"), (2, "A"))

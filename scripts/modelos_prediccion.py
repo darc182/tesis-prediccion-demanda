@@ -4,6 +4,7 @@ Configuraciones iniciales, sin optimización ni evaluación: 100 árboles/etapas
 acotan el coste experimental; los mínimos de hoja moderan el ajuste local.
 Boosting usa pasos de 0.05 y hasta 15 hojas por árbol. early_stopping=False
 mantiene 100 iteraciones sin separación automática de validación. Semilla 42.
+Se admiten configuraciones opcionales del contrato F2, conservando esos defaults.
 Un hilo para los estimadores y bibliotecas numéricas limita el paralelismo.
 Se conservan decimales; tras comprobar finitud se aplica max(0, predicción).
 No se persisten modelos ni resultados. Instalar requirements-modelado.txt.
@@ -12,6 +13,7 @@ No se persisten modelos ni resultados. Instalar requirements-modelado.txt.
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from datetime import date, timedelta
 from math import isfinite
@@ -36,6 +38,7 @@ from scripts.preparar_series_modelado import historico_hasta, leer_configuracion
 from scripts.variables_predictoras import (
     COLUMNAS_PREDICTORAS, construir_tabla_serie, construir_variables_futuras,
 )
+from backend.app.services import configuracion_experimentos as configuracion
 
 
 TECNICAS = ("random_forest", "hist_gradient_boosting")
@@ -77,40 +80,76 @@ class Resultado:
         return sum(p.ajustada_a_cero for p in self.predicciones)
 
 
-def crear_estimador(tecnica: str):
-    """Siempre devuelve una instancia nueva con configuración fija."""
-    if tecnica == "random_forest":
-        return RandomForestRegressor(n_estimators=100, min_samples_leaf=5,
-                                     random_state=42, n_jobs=1)
-    if tecnica == "hist_gradient_boosting":
-        return HistGradientBoostingRegressor(
-            max_iter=100, learning_rate=0.05, max_leaf_nodes=15,
-            min_samples_leaf=20, early_stopping=False, random_state=42,
-        )
-    raise ValueError(f"Técnica desconocida: {tecnica}. Opciones: {TECNICAS}")
+def normalizar_configuracion_entrenamiento(tecnica: str, configuracion_solicitada: dict | None = None) -> dict:
+    """Valida F2 y las restricciones del motor F3, sin entrenar ni modificar entradas.
+
+    F2 puede identificar permutaciones; este motor solo ejecuta las seis columnas
+    originales en su orden. La configuración de variables corresponde a HU004-H.
+    """
+    if tecnica not in TECNICAS:
+        raise ValueError(f"Técnica desconocida: {tecnica}. Opciones: {TECNICAS}")
+    efectiva = configuracion.normalizar_configuracion(
+        {"tecnica": tecnica} if configuracion_solicitada is None else configuracion_solicitada)
+    if efectiva["tecnica"] != tecnica:
+        raise ValueError("La técnica de la configuración no coincide con la solicitada.")
+    if (tuple(efectiva["variables"]) != COLUMNAS_PREDICTORAS
+            or COLUMNAS_PREDICTORAS != configuracion.VARIABLES):
+        raise ValueError("F3 requiere las seis variables originales en su orden original.")
+    return efectiva
+
+
+def comprobar_parametros_efectivos(estimador, efectiva: dict) -> None:
+    """Contrasta TODO get_params con lo declarado, sin perder tipos significativos.
+
+    No completar defaults aquí: una clave omitida por el estimador es un error.
+    En RF max_features=1 (número) no equivale a 1.0 (fracción de variables).
+    """
+    actual = json.dumps(estimador.get_params(deep=False), sort_keys=True, allow_nan=False)
+    declarado = json.dumps(efectiva["parametros"], sort_keys=True, allow_nan=False)
+    if actual != declarado:
+        raise ValueError("Los parámetros reales no corresponden a la configuración solicitada.")
+
+
+def crear_estimador(tecnica: str, *, configuracion_solicitada: dict | None = None):
+    """Nueva instancia con parámetros F2 efectivos; sin argumento conserva HU004."""
+    efectiva = normalizar_configuracion_entrenamiento(tecnica, configuracion_solicitada)
+    clases = {"random_forest": RandomForestRegressor,
+              "hist_gradient_boosting": HistGradientBoostingRegressor}
+    estimador = clases[tecnica](**efectiva["parametros"])
+    comprobar_parametros_efectivos(estimador, efectiva)
+    return estimador
 
 
 def entrenar_modelo(
     datos: pd.DataFrame, store_nbr: int, family: str, tecnica: str, fecha_corte: date,
+    *, configuracion_solicitada: dict | None = None,
 ) -> ModeloEntrenado:
     """Ajusta solo con las seis columnas aprobadas y las respuestas hasta corte.
 
     Se exige al menos una fila completa para permitir fit. Este mínimo es un
     requisito técnico, no una afirmación sobre suficiencia estadística.
+    configuracion_solicitada acepta el objeto F2 (parcial o completo). Se valida
+    antes de preparar X o ejecutar fit; no se modifica el DataFrame del llamador.
     """
     inicio = perf_counter()
     contexto = f"{store_nbr}/{family}, {tecnica}, corte {fecha_corte}"
     try:
+        efectiva = normalizar_configuracion_entrenamiento(tecnica, configuracion_solicitada)
         preparado = construir_tabla_serie(datos, store_nbr, family, fecha_corte)
         if preparado.tabla.empty:
             raise ValueError("No hay filas completas de entrenamiento.")
         x = preparado.tabla.loc[:, list(COLUMNAS_PREDICTORAS)]
         y = preparado.tabla["sales"]
-        estimador = crear_estimador(tecnica)
+        estimador = crear_estimador(tecnica) if configuracion_solicitada is None else crear_estimador(
+            tecnica, configuracion_solicitada=efectiva)
+        if configuracion_solicitada is not None:
+            comprobar_parametros_efectivos(estimador, efectiva)
         # threadpoolctl es una dependencia de scikit-learn. HGB usa OpenMP
         # y no tiene n_jobs; también limitamos sus hilos durante fit/predict.
         with threadpool_limits(limits=1):
             estimador.fit(x, y)
+        if configuracion_solicitada is not None:
+            comprobar_parametros_efectivos(estimador, efectiva)
     except (ValueError, TypeError) as error:
         raise ValueError(f"Error de entrenamiento en {contexto}: {error}") from error
     return ModeloEntrenado(
