@@ -25,6 +25,7 @@ import pandas as pd
 from scripts import linea_base_prediccion as linea_base
 from scripts.analizar_periodo_seleccion import HORIZONTE_DIAS, VENTANAS_POSTERIORES
 from scripts.preparar_series_modelado import preparar_observaciones
+from backend.app.services import configuracion_experimentos as configuracion
 
 
 TECNICAS = (linea_base.TECNICA, "random_forest", "hist_gradient_boosting")
@@ -132,18 +133,13 @@ def _calcular(instantanea: _Instantanea, tecnica: str, corte: date):
     datos["store_nbr"] = instantanea.store_nbr
     datos["family"] = instantanea.family
     datos = preparar_observaciones(datos)
-    reglas = {"horizonte_dias": HORIZONTE_DIAS, "ventas_reales_hasta_corte_inclusive": True,
-              "ausencias_no_son_ceros": True, "redondeo_interno": False}
+    reglas = configuracion.reglas_heredadas(tecnica)
     versiones = {"python": platform.python_version(), "pandas": pd.__version__}
     if tecnica == linea_base.TECNICA:
         predicciones = linea_base.pronosticar_serie(
             datos, instantanea.store_nbr, instantanea.family, corte,
         )
         parametros = {"periodo_estacional_dias": 7}
-        reglas.update({"referencia": "objetivo menos 7 días; real hasta corte o predicción previa",
-                       "respaldos": ["última observación real del mismo día semanal",
-                                     "última observación real disponible"],
-                       "sin_historial": "error"})
         entrenamiento = {"observaciones_disponibles": len(datos)}
         auditoria = {"respaldos_directos": sum(p.uso_respaldo for p in predicciones)}
     else:
@@ -152,15 +148,8 @@ def _calcular(instantanea: _Instantanea, tecnica: str, corte: date):
         modelo = modelos.entrenar_modelo(datos, instantanea.store_nbr, instantanea.family, tecnica, corte)
         predicciones = modelos.pronosticar_recursivo(modelo, datos)
         parametros = modelo.estimador.get_params(deep=False)
-        reglas.update({"predictoras": list(modelos.COLUMNAS_PREDICTORAS),
-                       "onpromotion_predictor": False, "dias_naturales_exactos": True,
-                       "media_7": "siete observaciones de los siete días anteriores completos",
-                       "dia_semana": "lunes=0, domingo=6", "mes": "enero=1, diciembre=12",
-                       "entrenamiento_incompleto": "excluir fila",
-                       "inferencia_incompleta": "error sin imputación",
-                       "recursion": "incorporar solo estimaciones previas al objetivo",
-                       "negativos": "comprobar finitud y aplicar max(0, predicción)",
-                       "hilos_numericos": 1})
+        if tuple(modelos.COLUMNAS_PREDICTORAS) != configuracion.VARIABLES:
+            raise ValueError("Las variables reales no corresponden al contrato predictivo.")
         versiones["scikit_learn"] = modelos.sklearn.__version__
         entrenamiento = {"filas_validas": modelo.filas_validas,
                           "filas_descartadas": modelo.filas_descartadas,
@@ -170,7 +159,12 @@ def _calcular(instantanea: _Instantanea, tecnica: str, corte: date):
     fin = datos["date"].max().date().isoformat()
     huella = hashlib.sha256(json.dumps(instantanea.filas, ensure_ascii=False,
                                       allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
-    config = {"version_registro": 1, "tecnica": tecnica, "parametros": parametros,
+    predictiva = configuracion.normalizar_configuracion({"tecnica": tecnica, "parametros": parametros})
+    if configuracion.json_canonico(predictiva) != configuracion.json_canonico(
+            configuracion.configuracion_predeterminada(tecnica)):
+        raise ValueError("Los parámetros reales no corresponden a los defaults del contrato.")
+    config = {"version_registro": 2, "configuracion_predictiva": predictiva,
+              "tecnica": tecnica, "parametros": parametros,
               "reglas": reglas, "versiones": versiones, "entrenamiento": entrenamiento,
               "auditoria": auditoria,
               "historial": {"inicio_disponible": inicio, "fin_disponible": fin,
@@ -209,13 +203,8 @@ def _leer_detalles(conexion, pronostico_id):
 
 
 def _contenido_config(config):
-    """Comparación determinista del JSON completo de F1, sin persistir otra identidad.
-
-    Ignora espacios y orden de claves; conserva valores y orden de listas.
-    Incluye auditoría, versiones e histórico tal como se registraban en HU004.
-    """
-    return json.dumps(config, ensure_ascii=False, sort_keys=True, allow_nan=False,
-                      separators=(",", ":"))
+    """Identidad predictiva común a registros HU004/F1 y F2; excluye auditoría."""
+    return configuracion.identidad_configuracion(configuracion.recuperar_configuracion(config))
 
 
 def _buscar_identico(conexion, serie_id, tecnica, corte, config, inicio, fin, detalles):
@@ -230,19 +219,29 @@ def _buscar_identico(conexion, serie_id, tecnica, corte, config, inicio, fin, de
     coincidencias = []
     for fila in existentes:
         try:
-            misma_config = _contenido_config(json.loads(fila[2])) == contenido
+            guardada = json.loads(fila[2])
+            if not isinstance(guardada, dict) or guardada.get("tecnica") != tecnica:
+                raise ValueError("Técnica almacenada inconsistente con el experimento.")
+            misma_config = _contenido_config(guardada) == contenido
         except (ValueError, TypeError):
             raise ErrorRegistroPronostico(
-                "conflicto", "No se puede determinar la configuración de un pronóstico almacenado.")
+                "conflicto", "No se puede reconstruir con seguridad la identidad de un pronóstico almacenado.")
         if misma_config:
-            coincidencias.append(fila)
+            coincidencias.append((fila, guardada))
     if not coincidencias:
         return None
     # No elegir arbitrariamente ni siquiera si uno de los duplicados coincide.
     if len(coincidencias) != 1:
         raise ErrorRegistroPronostico(
             "conflicto", "Existen varios pronósticos ambiguos con la misma configuración.")
-    e, p, _, inicio_guardado, fin_guardado, ruta_modelo, horizonte = coincidencias[0]
+    fila, guardada = coincidencias[0]
+    e, p, _, inicio_guardado, fin_guardado, ruta_modelo, horizonte = fila
+    # No forma parte de la identidad predictiva. Sigue siendo evidencia obligatoria
+    # para reutilizar: también detecta cambios entre ejecuciones, aunque y_hat coincida.
+    if (not isinstance(guardada.get("historial"), dict)
+            or guardada["historial"] != config.get("historial")):
+        raise ErrorRegistroPronostico(
+            "conflicto", "El histórico asociado a la misma configuración cambió o no puede verificarse.")
     guardados = _leer_detalles(conexion, p)
     if len(guardados) != HORIZONTE_DIAS:
         raise ErrorRegistroPronostico(
@@ -277,6 +276,9 @@ def registrar_pronostico(
     try:
         predicciones, config, inicio, fin = _calcular(instantanea, tecnica, corte)
         detalles = _validar_predicciones(predicciones, instantanea, tecnica, corte)
+        if not isinstance(config, dict) or config.get("tecnica") != tecnica:
+            raise ErrorRegistroPronostico("resultado_invalido", "La configuración no corresponde a la técnica solicitada.")
+        _contenido_config(config)  # validar antes del bloqueo, también al primer registro
         texto_config = json.dumps(config, ensure_ascii=False, sort_keys=True, allow_nan=False)
     except ErrorRegistroPronostico:
         raise

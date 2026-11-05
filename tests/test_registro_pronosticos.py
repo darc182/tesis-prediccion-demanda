@@ -2,6 +2,7 @@
 
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 import json
@@ -12,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from backend.app.services import registro_pronosticos as registro
+from backend.app.services import configuracion_experimentos as configuracion
 from backend.app.services.consulta_pronosticos import consultar_pronostico, listar_pronosticos
 from backend.app.storage.db import conectar, inicializar_base
 from scripts import modelos_prediccion as modelos
@@ -58,17 +60,26 @@ class RegistroPronosticosTests(unittest.TestCase):
                      for t in ("conjunto_datos", "serie_temporal", "venta_diaria"))
 
     def resultado_config(self, nombre, valor=0):
-        """Doble del cálculo: cambia solo el resultado de prueba, nunca los modelos."""
+        """Cálculo SINTÉTICO: parámetros válidos RF, sin afirmar que se entrenaron.
+
+        Usa predicciones de línea base como datos de prueba y cambia sus metadatos.
+        Los modelos reales continúan probándose sin mocks en sus propios tests.
+        """
         with closing(conectar(self.ruta)) as c:
             instantanea = registro._leer_instantanea(c, 83, CORTE)
         predicciones, config, inicio, fin = registro._calcular(instantanea, BASE, CORTE)
-        config["parametros"]["configuracion_de_prueba"] = nombre
-        predicciones = tuple(replace(p, venta_estimada=p.venta_estimada + valor) for p in predicciones)
+        predictiva = configuracion.normalizar_configuracion({
+            "tecnica": "random_forest", "parametros": {"n_estimators": {"A": 100, "B": 110, "C": 120}[nombre]}})
+        config.update({"tecnica": "random_forest", "parametros": predictiva["parametros"],
+                       "configuracion_predictiva": predictiva,
+                       "reglas": configuracion.reglas_heredadas("random_forest")})
+        predicciones = tuple(replace(p, tecnica="random_forest", venta_estimada=p.venta_estimada + valor)
+                             for p in predicciones)
         return predicciones, config, inicio, fin
 
     def registrar_resultado(self, resultado):
         with patch.object(registro, "_calcular", return_value=resultado):
-            return self.registrar()
+            return self.registrar(resultado[1]["tecnica"])
 
     def test_registro_linea_base_relaciones_y_metadatos(self):
         anterior = self.historicos()
@@ -233,6 +244,147 @@ class RegistroPronosticosTests(unittest.TestCase):
         self.assertEqual(self.ruta.read_bytes(), contenido)
         self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
 
+    def convertir_a_formato_antiguo(self, experimento_id):
+        texto = self.consultar("SELECT configuracion_json FROM experimento WHERE id=?",
+                               (experimento_id,))[0][0]
+        config = json.loads(texto)
+        config.pop("configuracion_predictiva")
+        config["version_registro"] = 1
+        texto = json.dumps(config, ensure_ascii=False, indent=2)
+        self.consultar("UPDATE experimento SET configuracion_json=? WHERE id=?", (texto, experimento_id))
+        return texto
+
+    def test_reutiliza_defaults_antiguos_de_las_tres_tecnicas_sin_migrar(self):
+        historicos = self.historicos()
+        for tecnica in registro.TECNICAS:
+            with self.subTest(tecnica=tecnica):
+                anterior = self.registrar(tecnica)
+                texto = self.convertir_a_formato_antiguo(anterior.experimento_id)
+                contenido = self.ruta.read_bytes()
+                nuevo = self.registrar(tecnica)
+                self.assertTrue(nuevo.reutilizado)
+                self.assertEqual((nuevo.experimento_id, nuevo.pronostico_id),
+                                 (anterior.experimento_id, anterior.pronostico_id))
+                self.assertEqual(self.ruta.read_bytes(), contenido)
+                self.assertEqual(self.consultar("SELECT configuracion_json FROM experimento WHERE id=?",
+                                                (anterior.experimento_id,)), [(texto,)])
+        self.assertEqual(self.conteos(), (3, 3, 45, 0, 0))
+        self.assertEqual(self.historicos(), historicos)
+
+    def test_cambios_solo_en_auditoria_versiones_y_duracion_reutilizan_sin_escritura(self):
+        for formato in (1, 2):
+            with self.subTest(formato=formato):
+                # Otra serie temporal sintética permite comprobar ambos formatos sin borrar.
+                serie = 83 if formato == 1 else 84
+                r = self.registrar(serie=serie)
+                if formato == 1:
+                    self.convertir_a_formato_antiguo(r.experimento_id)
+                self.consultar("UPDATE pronostico SET duracion_segundos=999 WHERE id=?", (r.pronostico_id,))
+                calcular = registro._calcular
+
+                def cambiar_metadatos(*args):
+                    p, c, inicio, fin = calcular(*args)
+                    c["versiones"] = {"python": "otra", "pandas": "otra", "scikit_learn": "otra"}
+                    c["auditoria"] = {"otro_dato_tecnico": 123}
+                    c["entrenamiento"] = {"observaciones_disponibles": 999}
+                    return p, c, inicio, fin
+
+                contenido = self.ruta.read_bytes()
+                with patch.object(registro, "_calcular", side_effect=cambiar_metadatos):
+                    repetido = self.registrar(serie=serie)
+                self.assertTrue(repetido.reutilizado)
+                self.assertEqual(repetido.pronostico_id, r.pronostico_id)
+                self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (2, 2, 30, 0, 0))
+
+    def test_historial_cambiado_entre_ejecuciones_no_reutiliza_aunque_estimaciones_coincidan(self):
+        r = self.registrar()
+        self.convertir_a_formato_antiguo(r.experimento_id)
+        originales = consultar_pronostico(self.ruta, r.pronostico_id)
+        # Un dato antiguo no afecta la copia semanal, pero sí la huella del histórico.
+        self.consultar("UPDATE venta_diaria SET sales=sales+10 WHERE serie_id=83 AND fecha=?",
+                       (self.filas[0][0],))
+        contenido = self.ruta.read_bytes()
+        with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "histórico.*cambió") as error:
+            self.registrar()
+        self.assertEqual(error.exception.codigo, "conflicto")
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(consultar_pronostico(self.ruta, r.pronostico_id), originales)
+        self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
+
+    def test_historial_no_verificable_no_se_reutiliza(self):
+        r = self.registrar()
+        texto = self.convertir_a_formato_antiguo(r.experimento_id)
+        c = json.loads(texto)
+        del c["historial"]
+        self.consultar("UPDATE experimento SET configuracion_json=?", (json.dumps(c),))
+        contenido = self.ruta.read_bytes()
+        with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "histórico.*verificarse"):
+            self.registrar()
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_ambiguedad_entre_formato_antiguo_y_nuevo_rechazada(self):
+        a, b = self.resultado_config("A"), self.resultado_config("B")
+        ra, rb = self.registrar_resultado(a), self.registrar_resultado(b)
+        antiguo = deepcopy(a[1])
+        antiguo.pop("configuracion_predictiva")
+        antiguo["version_registro"] = 1
+        self.consultar("UPDATE experimento SET configuracion_json=? WHERE id=?",
+                       (json.dumps(antiguo), rb.experimento_id))
+        contenido = self.ruta.read_bytes()
+        with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "ambiguos"):
+            self.registrar_resultado(a)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertNotEqual(ra.pronostico_id, rb.pronostico_id)
+
+    def test_configuraciones_antiguas_abc_se_reutilizan_independientemente(self):
+        resultados = {n: self.resultado_config(n, v) for n, v in (("A", 0), ("B", 10), ("C", 20))}
+        registros = {n: self.registrar_resultado(r) for n, r in resultados.items()}
+        for r in registros.values():
+            self.convertir_a_formato_antiguo(r.experimento_id)
+        contenido = self.ruta.read_bytes()
+        for n in ("C", "A", "B"):
+            r = self.registrar_resultado(resultados[n])
+            self.assertTrue(r.reutilizado)
+            self.assertEqual((r.experimento_id, r.pronostico_id),
+                             (registros[n].experimento_id, registros[n].pronostico_id))
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (3, 3, 45, 0, 0))
+
+    def test_series_cortes_y_tecnicas_mantienen_contextos_separados(self):
+        registros = [self.registrar(), self.registrar(corte=date(2017, 7, 1)),
+                     self.registrar(serie=84), self.registrar("random_forest")]
+        self.assertEqual(len({r.pronostico_id for r in registros}), 4)
+        for r in registros:
+            repetido = self.registrar(r.tecnica, r.fecha_corte, r.serie_id)
+            self.assertTrue(repetido.reutilizado)
+            self.assertEqual(repetido.pronostico_id, r.pronostico_id)
+        self.assertEqual(self.conteos(), (4, 4, 60, 0, 0))
+
+    def test_defaults_del_contrato_no_reetiquetan_estimador_con_otro_parametro(self):
+        crear = modelos.crear_estimador
+        for cambio in ({"n_estimators": 101}, {"max_features": 1}):
+            def cambiar(tecnica):
+                return crear(tecnica).set_params(**cambio)
+
+            contenido = self.ruta.read_bytes()
+            with self.subTest(cambio=cambio), patch.object(modelos, "crear_estimador", side_effect=cambiar):
+                with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "defaults del contrato"):
+                    self.registrar("random_forest")
+            self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (0, 0, 0, 0, 0))
+
+    def test_configuracion_no_se_asocia_a_otra_tecnica(self):
+        resultado = self.resultado_config("A")
+        contenido = self.ruta.read_bytes()
+        # Predicciones y solicitud de base, pero configuración RF: rechazar antes de INSERT.
+        predicciones = tuple(replace(p, tecnica=BASE) for p in resultado[0])
+        with patch.object(registro, "_calcular", return_value=(predicciones, *resultado[1:])):
+            with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "configuración.*técnica") as error:
+                self.registrar()
+        self.assertEqual(error.exception.codigo, "resultado_invalido")
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
     def test_rechaza_duplicado_con_valores_conflictivos_sin_sobrescribir(self):
         self.registrar()
         self.consultar("UPDATE detalle_pronostico SET venta_estimada=99 WHERE paso=1")
@@ -252,15 +404,15 @@ class RegistroPronosticosTests(unittest.TestCase):
         self.assertEqual(self.ruta.read_bytes(), contenido)
         self.assertEqual(self.conteos(), (1, 1, 14, 0, 0))
 
-    def test_configuracion_distinta_no_impide_registro_predeterminado(self):
-        anterior = self.registrar()
+    def test_configuracion_antigua_irreconocible_rechaza_sin_inventar_defaults(self):
+        self.registrar()
         self.consultar("UPDATE experimento SET configuracion_json='{}'")
-        nuevo = self.registrar()
-        self.assertTrue(nuevo.nuevo)
-        self.assertNotEqual(nuevo.experimento_id, anterior.experimento_id)
-        self.assertEqual(self.consultar("SELECT configuracion_json FROM experimento WHERE id=?",
-                                        (anterior.experimento_id,)), [("{}",)])
-        self.assertEqual(self.conteos(), (2, 2, 30, 0, 0))
+        contenido = self.ruta.read_bytes()
+        with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "reconstruir con seguridad") as error:
+            self.registrar()
+        self.assertEqual(error.exception.codigo, "conflicto")
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
 
     def test_tres_configuraciones_coexisten_y_se_reutilizan_sin_escrituras(self):
         resultados = {n: self.resultado_config(n, v) for n, v in (("A", 0), ("B", 10), ("C", 20))}
@@ -340,17 +492,26 @@ class RegistroPronosticosTests(unittest.TestCase):
         self.assertEqual(segundo.pronostico_id, primero.pronostico_id)
         self.assertEqual(self.ruta.read_bytes(), contenido)
 
-    def test_orden_de_listas_y_tipos_json_diferencian_configuraciones(self):
-        for valor in ([1, 2], [2, 1], True, 1, "1"):
-            self.assertTrue(self.registrar_resultado(self.resultado_config(valor)).nuevo)
-        self.assertEqual(self.conteos(), (5, 5, 75, 0, 0))
+    def test_orden_de_variables_diferencia_configuraciones(self):
+        a = self.resultado_config("A")
+        b = self.resultado_config("A")
+        b[1]["configuracion_predictiva"]["variables"].reverse()
+        b[1]["reglas"]["predictoras"].reverse()
+        ra, rb = self.registrar_resultado(a), self.registrar_resultado(b)
+        self.assertNotEqual(ra.experimento_id, rb.experimento_id)
+        self.assertEqual(self.registrar_resultado(a).pronostico_id, ra.pronostico_id)
+        self.assertEqual(self.registrar_resultado(b).pronostico_id, rb.pronostico_id)
+        self.assertEqual(self.conteos(), (2, 2, 30, 0, 0))
 
     def test_misma_configuracion_resultado_distinto_conflicto_aunque_exista_otra(self):
         a = self.resultado_config("A")
         self.registrar_resultado(a)
         self.registrar_resultado(self.resultado_config("B", 10))
         contenido = self.ruta.read_bytes()
-        alterado = (tuple(replace(p, venta_estimada=p.venta_estimada + 1) for p in a[0]), *a[1:])
+        otra_auditoria = deepcopy(a[1])
+        otra_auditoria["versiones"] = {"python": "otra", "scikit_learn": "otra"}
+        alterado = (tuple(replace(p, venta_estimada=p.venta_estimada + 1) for p in a[0]),
+                    otra_auditoria, *a[2:])
         with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "conflictivo") as error:
             self.registrar_resultado(alterado)
         self.assertEqual(error.exception.codigo, "conflicto")
@@ -427,7 +588,7 @@ class RegistroPronosticosTests(unittest.TestCase):
 
         with patch.object(registro, "_calcular", side_effect=calcular):
             with ThreadPoolExecutor(max_workers=2) as ejecutor:
-                futuros = [ejecutor.submit(self.registrar) for _ in range(2)]
+                futuros = [ejecutor.submit(self.registrar, "random_forest") for _ in range(2)]
                 resultados = [f.result(timeout=20) for f in futuros]
         self.assertEqual(sorted(r.nuevo for r in resultados), [False, True])
         self.assertEqual(len({(r.experimento_id, r.pronostico_id) for r in resultados}), 1)
