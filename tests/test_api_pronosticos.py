@@ -3,6 +3,7 @@
 from contextlib import closing
 from datetime import date, timedelta
 import inspect
+import json
 import os
 import sqlite3
 from unittest.mock import patch
@@ -15,12 +16,14 @@ from backend.app.api.datasets import obtener_ruta_base
 from backend.app.main import app
 from backend.app.services import consulta_pronosticos as consulta
 from backend.app.services import registro_pronosticos as registro
+from backend.app.services import configuracion_experimentos as configuraciones
 from backend.app.storage.db import conectar
 from tests import test_registro_pronosticos as fixtures
 
 
 BASE = "estacional_semanal_recursiva"
 PREFIJO = "/api/pronosticos/active"
+OMITIDA = object()
 
 
 class ApiPronosticosTests(unittest.TestCase):
@@ -35,14 +38,306 @@ class ApiPronosticosTests(unittest.TestCase):
         app.dependency_overrides[obtener_ruta_base] = lambda: self.ruta
         self.cliente = self.enterContext(TestClient(app))
 
-    def post(self, tecnica=BASE, corte="2017-06-16", serie=83):
-        return self.cliente.post(f"{PREFIJO}/series/{serie}",
-                                 json={"tecnica": tecnica, "fecha_corte": corte})
+    def post(self, tecnica=BASE, corte="2017-06-16", serie=83, *, configuracion=OMITIDA):
+        cuerpo = {"tecnica": tecnica, "fecha_corte": corte}
+        if configuracion is not OMITIDA:
+            cuerpo["configuracion"] = configuracion
+        return self.cliente.post(f"{PREFIJO}/series/{serie}", json=cuerpo)
 
-    def crear(self, tecnica=BASE, corte="2017-06-16", serie=83):
-        respuesta = self.post(tecnica, corte, serie)
+    def crear(self, tecnica=BASE, corte="2017-06-16", serie=83, *, configuracion=OMITIDA):
+        respuesta = self.post(tecnica, corte, serie, configuracion=configuracion)
         self.assertEqual(respuesta.status_code, 201, respuesta.text)
         return respuesta.json()
+
+    def comprobar_respuesta_publica(self, respuesta):
+        self.assertEqual(set(respuesta), {"conjunto_id", "serie_id", "experimento_id", "pronostico_id",
+                                          "tecnica", "fecha_corte", "horizonte", "cantidad_detalles", "nuevo", "reutilizado"})
+        self.assertEqual((respuesta["horizonte"], respuesta["cantidad_detalles"]), (15, 15))
+
+    def crear_cuatro_http(self):
+        casos = [
+            ("random_forest", OMITIDA),
+            ("random_forest", {"tecnica": "random_forest", "parametros": {
+                "n_estimators": 200, "max_depth": 4, "random_state": 7}}),
+            ("hist_gradient_boosting", OMITIDA),
+            ("hist_gradient_boosting", {"tecnica": "hist_gradient_boosting", "parametros": {
+                "max_iter": 150, "learning_rate": 0.1, "l2_regularization": 0.5, "random_state": 11}}),
+        ]
+        return [(t, c, self.crear(t, configuracion=c)) for t, c in casos]
+
+    def comprobar_alternativo_real(self, tecnica, parametros):
+        default = self.crear(tecnica)
+        anterior = self.cliente.get(f"{PREFIJO}/{default['pronostico_id']}").json()
+        solicitud = {"tecnica": tecnica, "parametros": parametros}
+        modelos = []
+        entrenar = fixtures.modelos.entrenar_modelo
+
+        def observar(*args, **kwargs):
+            m = entrenar(*args, **kwargs)  # fit real; no se sustituye ningún resultado
+            modelos.append(m)
+            return m
+
+        with patch.object(api, "registrar_pronostico", wraps=registro.registrar_pronostico) as registrar, \
+                patch.object(fixtures.modelos, "entrenar_modelo", side_effect=observar):
+            alternativo = self.crear(tecnica, configuracion=solicitud)
+        registrar.assert_called_once_with(self.ruta, 83, tecnica, "2017-06-16",
+            configuracion_solicitada=configuraciones.normalizar_configuracion(solicitud))
+        self.assertEqual(len(modelos), 1)
+        estimador = modelos[0].estimador
+        if tecnica == "random_forest":
+            self.assertEqual(len(estimador.estimators_), parametros["n_estimators"])
+        else:
+            self.assertEqual(estimador.n_iter_, parametros["max_iter"])
+        c = json.loads(self.datos.consultar("SELECT configuracion_json FROM experimento WHERE id=?",
+                                           (alternativo["experimento_id"],))[0][0])
+        self.assertEqual(json.dumps(c["parametros"], sort_keys=True),
+                         json.dumps(estimador.get_params(deep=False), sort_keys=True))
+        for k, v in parametros.items():
+            self.assertEqual(c["parametros"][k], v)
+        self.assertNotEqual(default["experimento_id"], alternativo["experimento_id"])
+        self.assertNotEqual(default["pronostico_id"], alternativo["pronostico_id"])
+        contenido = self.ruta.read_bytes()
+        for config, previo in ((solicitud, alternativo), (OMITIDA, default)):
+            r = self.post(tecnica, configuracion=config)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.comprobar_respuesta_publica(r.json())
+            self.assertTrue(r.json()["reutilizado"])
+            self.assertEqual((r.json()["experimento_id"], r.json()["pronostico_id"]),
+                             (previo["experimento_id"], previo["pronostico_id"]))
+            self.assertEqual(len(self.cliente.get(f"{PREFIJO}/{previo['pronostico_id']}").json()["detalles"]), 15)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.cliente.get(f"{PREFIJO}/{default['pronostico_id']}").json(), anterior)
+        self.assertEqual(self.datos.conteos(), (2, 2, 30, 0, 0))
+        # Otro parámetro crea otro experimento; no se exige que las estimaciones difieran.
+        nuevos = dict(parametros)
+        nuevos["random_state"] = 43
+        tercero = self.crear(tecnica, configuracion={"tecnica": tecnica, "parametros": nuevos})
+        self.assertEqual(len({r["experimento_id"] for r in (default, alternativo, tercero)}), 3)
+        self.comprobar_respuesta_publica(alternativo)
+
+    def test_post_random_forest_configurado_entrena_200_arboles_y_reutiliza_independientemente(self):
+        self.comprobar_alternativo_real("random_forest", {"n_estimators": 200, "max_depth": 4, "random_state": 7})
+
+    def test_post_hist_gradient_boosting_configurado_entrena_150_iteraciones_y_reutiliza(self):
+        self.comprobar_alternativo_real("hist_gradient_boosting", {"max_iter": 150, "learning_rate": 0.1,
+                                                                "l2_regularization": 0.5, "random_state": 11})
+
+    def test_cuatro_experimentos_http_conservan_formato_historico_y_reutilizan_sin_dml(self):
+        historicos = self.datos.historicos()
+        casos = self.crear_cuatro_http()
+        self.assertEqual(len({r["experimento_id"] for _, _, r in casos}), 4)
+        self.assertEqual(len({r["pronostico_id"] for _, _, r in casos}), 4)
+        self.assertEqual(self.datos.conteos(), (4, 4, 60, 0, 0))
+        contenido = self.ruta.read_bytes()
+        sentencias = []
+        abrir = registro._abrir_base
+
+        def observar(*args, **kwargs):
+            c = abrir(*args, **kwargs)
+            c.set_trace_callback(sentencias.append)
+            return c
+
+        with patch.object(registro, "_abrir_base", side_effect=observar):
+            for t, c, previo in reversed(casos):
+                respuesta = self.post(t, configuracion=c)
+                self.assertEqual(respuesta.status_code, 200, respuesta.text)
+                self.assertEqual(respuesta.json(), {**previo, "nuevo": False, "reutilizado": True})
+                self.comprobar_respuesta_publica(respuesta.json())
+        self.assertFalse(any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) for s in sentencias))
+        lista = self.cliente.get(f"{PREFIJO}/series/83")
+        self.assertEqual({p["id"] for p in lista.json()["pronosticos"]}, {r["pronostico_id"] for _, _, r in casos})
+        for _, _, r in casos:
+            detalle = self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}")
+            self.assertEqual(len(detalle.json()["detalles"]), 15)
+            self.assertEqual(set(detalle.json()), {"conjunto_id", "serie", "pronostico", "detalles"})
+            self.assertEqual(set(detalle.json()["pronostico"]), {
+                "id", "experimento_id", "tecnica", "fecha_corte", "tipo", "horizonte", "fecha_generacion",
+                "inicio_entrenamiento", "fin_entrenamiento", "duracion_segundos"})
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.datos.historicos(), historicos)
+        self.assertEqual(self.datos.consultar("PRAGMA foreign_key_check"), [])
+
+    def test_configuraciones_invalidas_son_422_sin_registro_entrenamiento_ni_conexiones(self):
+        casos = [None, [], "PRIVADO C:/datos/secreto", 1, True, {},
+                 {"parametros": {"n_estimators": 200}},
+                 {"tecnica": "hist_gradient_boosting"}, {"tecnica": "otra"},
+                 {"tecnica": "random_forest", "otro": "PRIVADO C:/datos/secreto"},
+                 {"tecnica": "random_forest", "parametros": []}]
+        for parametros in ({"otro": 1}, {"n_estimators": 0}, {"n_estimators": 501}, {"n_estimators": True},
+                           {"n_estimators": 100.0}, {"n_estimators": "200"}, {"random_state": False},
+                           {"max_depth": -1}, {"n_jobs": 2}, {"warm_start": True},
+                           {"ccp_alpha": 0.1}, {"max_features": 7}, {"max_features": 0}):
+            casos.append({"tecnica": "random_forest", "parametros": parametros})
+        for variables in ([], list(configuraciones.VARIABLES[:-1]), [*configuraciones.VARIABLES, "onpromotion"],
+                          list(reversed(configuraciones.VARIABLES)), [*configuraciones.VARIABLES, "lag_1"]):
+            casos.append({"tecnica": "random_forest", "variables": variables})
+        for campo, valor in (("horizonte", 30), ("horizonte", 15.0), ("version_contrato", 2),
+                              ("version_contrato", True), ("version_reglas", 2)):
+            casos.append({"tecnica": "random_forest", campo: valor})
+        contenido = self.ruta.read_bytes()
+        with patch.object(api, "registrar_pronostico") as registrar, \
+                patch.object(fixtures.modelos, "entrenar_modelo") as entrenar, \
+                patch.object(registro, "_abrir_base") as abrir:
+            for c in casos:
+                with self.subTest(configuracion=c):
+                    respuesta = self.post("random_forest", configuracion=c)
+                    self.assertEqual(respuesta.status_code, 422, respuesta.text)
+                    self.assertEqual(respuesta.json(), {"detail": {"codigo": "configuracion_invalida",
+                                                       "mensaje": api.ERRORES["configuracion_invalida"][1]}})
+                    self.assertNotIn("PRIVADO", respuesta.text)
+                    self.assertNotIn("C:/datos", respuesta.text)
+            registrar.assert_not_called()
+            entrenar.assert_not_called()
+            abrir.assert_not_called()
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.datos.conteos(), (0, 0, 0, 0, 0))
+
+    def test_hgb_y_linea_base_rechazan_cambios_fijos_y_rangos_de_f2(self):
+        casos = [("hist_gradient_boosting", {"early_stopping": True}),
+                 ("hist_gradient_boosting", {"max_iter": 501}),
+                 ("hist_gradient_boosting", {"learning_rate": 0}),
+                 ("hist_gradient_boosting", {"max_features": 1.1}),
+                 ("hist_gradient_boosting", {"l2_regularization": -0.1}),
+                 (BASE, {"periodo_estacional_dias": 14}), (BASE, {"random_state": 42})]
+        with patch.object(api, "registrar_pronostico") as registrar:
+            for t, p in casos:
+                with self.subTest(tecnica=t, parametros=p):
+                    r = self.post(t, configuracion={"tecnica": t, "parametros": p})
+                    self.assertEqual(r.status_code, 422)
+                    self.assertEqual(r.json()["detail"]["codigo"], "configuracion_invalida")
+            registrar.assert_not_called()
+
+    def test_numeros_no_finitos_recibidos_en_json_son_422(self):
+        with patch.object(api, "registrar_pronostico") as registrar, \
+                patch.object(fixtures.modelos, "entrenar_modelo") as entrenar:
+            for numero in ("NaN", "Infinity", "-Infinity", "1e309"):
+                cuerpo = ('{"tecnica":"hist_gradient_boosting","fecha_corte":"2017-06-16",'
+                          '"configuracion":{"tecnica":"hist_gradient_boosting","parametros":{"learning_rate":'
+                          + numero + '}}}')
+                r = self.cliente.post(f"{PREFIJO}/series/83", content=cuerpo, headers={"Content-Type": "application/json"})
+                self.assertEqual(r.status_code, 422, r.text)
+                self.assertEqual(r.json()["detail"]["codigo"], "configuracion_invalida")
+            registrar.assert_not_called()
+            entrenar.assert_not_called()
+
+    def test_error_de_validacion_no_expone_excepcion_interna(self):
+        with patch.object(api.configuraciones, "normalizar_configuracion", side_effect=ValueError("PRIVADO C:/secreto")), \
+                patch.object(api, "registrar_pronostico") as registrar:
+            r = self.post("random_forest", configuracion={"tecnica": "random_forest"})
+            self.assertEqual(r.status_code, 422)
+            self.assertNotIn("PRIVADO", r.text)
+            self.assertNotIn("C:/secreto", r.text)
+            registrar.assert_not_called()
+
+    def test_max_features_entero_y_fraccion_preservan_tipo_identidad_y_reutilizacion(self):
+        filas = []
+        for valor in (1, 1.0):
+            c = {"tecnica": "random_forest", "parametros": {"n_estimators": 20, "max_features": valor}}
+            r = self.crear("random_forest", configuracion=c)
+            texto = self.datos.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (r["experimento_id"],))[0][0]
+            guardada = json.loads(texto)
+            self.assertIs(type(guardada["parametros"]["max_features"]), type(valor))
+            filas.append((r, guardada))
+            repetido = self.post("random_forest", configuracion=c)
+            self.assertEqual(repetido.status_code, 200)
+            self.assertEqual(repetido.json()["pronostico_id"], r["pronostico_id"])
+        self.assertNotEqual(filas[0][0]["experimento_id"], filas[1][0]["experimento_id"])
+        self.assertNotEqual(registro._contenido_config(filas[0][1]), registro._contenido_config(filas[1][1]))
+
+    def test_linea_base_configurada_explicita_reutiliza_el_default_original(self):
+        r = self.crear()
+        contenido = self.ruta.read_bytes()
+        respuesta = self.post(configuracion={"tecnica": BASE})
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertEqual(respuesta.json()["pronostico_id"], r["pronostico_id"])
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_defaults_explicitos_se_normalizan_y_reutilizan_el_post_antiguo(self):
+        for t in ("random_forest", "hist_gradient_boosting"):
+            r = self.crear(t)
+            contenido = self.ruta.read_bytes()
+            respuesta = self.post(t, configuracion={"tecnica": t})
+            self.assertEqual(respuesta.status_code, 200)
+            self.assertEqual(respuesta.json()["experimento_id"], r["experimento_id"])
+            self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_post_antiguo_de_regresores_sigue_delegando_cuatro_argumentos_sin_kwargs(self):
+        for t in ("random_forest", "hist_gradient_boosting"):
+            with patch.object(api, "registrar_pronostico", wraps=registro.registrar_pronostico) as registrar:
+                r = self.crear(t)
+            registrar.assert_called_once_with(self.ruta, 83, t, "2017-06-16")
+            self.comprobar_respuesta_publica(r)
+
+    def test_configuracion_no_habilita_campos_externos_ni_tecnicas_invalidas(self):
+        cuerpo = {"tecnica": "random_forest", "fecha_corte": "2017-06-16",
+                  "configuracion": {"tecnica": "random_forest"}, "campo_desconocido": "PRIVADO"}
+        with patch.object(api, "registrar_pronostico") as registrar:
+            r = self.cliente.post(f"{PREFIJO}/series/83", json=cuerpo)
+            self.assertEqual(r.status_code, 422)
+            self.assertEqual(r.json()["detail"]["codigo"], "entrada_invalida")
+            self.assertNotIn("PRIVADO", r.text)
+            r = self.post("otra", configuracion={"tecnica": "random_forest"})
+            self.assertEqual(r.status_code, 422)
+            self.assertEqual(r.json()["detail"]["codigo"], "tecnica_invalida")
+            registrar.assert_not_called()
+
+    def test_configurada_conserva_cortes_autorizados_y_bloqueo_prueba_final(self):
+        # Completar solo esta fixture temporal hasta el tercer corte: los regresores
+        # exigen rezagos disponibles, a diferencia de los respaldos de la línea base.
+        with closing(conectar(self.ruta)) as conexion, conexion:
+            conexion.executemany("INSERT INTO venta_diaria (serie_id,fecha,sales,onpromotion) VALUES (?,?,?,?)",
+                                 [(83, (date(2017, 7, 1) + timedelta(days=i)).isoformat(), i * 0.25, 0)
+                                  for i in range(1, 16)])
+        c = {"tecnica": "random_forest", "parametros": {"n_estimators": 20}}
+        for corte in ("2017-06-16", "2017-07-01", "2017-07-16"):
+            r = self.crear("random_forest", corte, configuracion=c)
+            self.assertEqual(r["fecha_corte"], corte)
+        for corte, codigo in (("2017-06-15", "corte_no_autorizado"), ("2017-07-02", "corte_no_autorizado"),
+                               ("2017-07-31", "prueba_reservada")):
+            with patch.object(fixtures.modelos, "entrenar_modelo") as entrenar:
+                r = self.post("random_forest", corte, configuracion=c)
+                self.assertEqual(r.status_code, 422)
+                self.assertEqual(r.json()["detail"]["codigo"], codigo)
+                entrenar.assert_not_called()
+        self.assertEqual(self.datos.conteos(), (3, 3, 45, 0, 0))
+
+    def test_registros_anteriores_se_consultan_y_reutilizan_desde_http_sin_migrar(self):
+        casos = [("random_forest", 1), ("hist_gradient_boosting", 2)]
+        for t, version in casos:
+            r = self.crear(t)
+            if version == 1:
+                self.datos.convertir_a_formato_antiguo(r["experimento_id"])
+            contenido = self.ruta.read_bytes()
+            self.assertEqual(self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}").status_code, 200)
+            respuesta = self.post(t, configuracion={"tecnica": t})
+            self.assertEqual(respuesta.status_code, 200)
+            self.assertEqual(respuesta.json()["pronostico_id"], r["pronostico_id"])
+            self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_get_configuradas_es_solo_lectura_y_no_expone_campos_internos(self):
+        r = self.crear("random_forest", configuracion={"tecnica": "random_forest", "parametros": {"n_estimators": 20}})
+        contenido = self.ruta.read_bytes()
+        with patch.object(api, "registrar_pronostico") as registrar, \
+                patch.object(fixtures.modelos, "entrenar_modelo") as entrenar, \
+                patch.object(registro, "_abrir_base") as abrir:
+            for url in (f"{PREFIJO}/series/83", f"{PREFIJO}/{r['pronostico_id']}"):
+                respuesta = self.cliente.get(url)
+                self.assertEqual(respuesta.status_code, 200)
+                for campo in ("configuracion", "parametros", "sha256", "historial", "auditoria", "versiones", "ruta_modelo"):
+                    self.assertNotIn(campo, respuesta.text)
+            registrar.assert_not_called()
+            entrenar.assert_not_called()
+            abrir.assert_not_called()
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_openapi_documenta_configuracion_opcional_objeto_no_nulo(self):
+        esquema = self.cliente.get("/openapi.json").json()["components"]["schemas"]["SolicitudPronostico"]
+        self.assertEqual(set(esquema["required"]), {"tecnica", "fecha_corte"})
+        self.assertEqual(esquema["properties"]["configuracion"]["type"], "object")
+        self.assertNotIn("anyOf", esquema["properties"]["configuracion"])
+        self.assertIs(esquema["additionalProperties"], False)
+        self.assertIn("contrato F2", esquema["properties"]["configuracion"]["description"])
+        self.assertEqual(esquema["properties"]["configuracion"]["examples"][0]["parametros"]["n_estimators"], 200)
 
     def test_get_serie_activa_sin_pronosticos(self):
         respuesta = self.cliente.get(f"{PREFIJO}/series/83")
