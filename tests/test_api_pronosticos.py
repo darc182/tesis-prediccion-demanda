@@ -1,6 +1,7 @@
 """API de pronósticos con TestClient y bases SQLite temporales por prueba."""
 
 from contextlib import closing
+from copy import deepcopy
 from datetime import date, timedelta
 import inspect
 import json
@@ -338,6 +339,291 @@ class ApiPronosticosTests(unittest.TestCase):
         self.assertIs(esquema["additionalProperties"], False)
         self.assertIn("contrato F2", esquema["properties"]["configuracion"]["description"])
         self.assertEqual(esquema["properties"]["configuracion"]["examples"][0]["parametros"]["n_estimators"], 200)
+
+    def obtener_configuracion(self, pronostico_id):
+        return self.cliente.get(f"{PREFIJO}/{pronostico_id}/configuracion")
+
+    def guardar_json_de_prueba(self, experimento_id, texto):
+        # Corrupción deliberada exclusivamente en SQLite temporal, no en schema.sql.
+        with closing(conectar(self.ruta)) as c, c:
+            c.execute("PRAGMA ignore_check_constraints=ON")
+            c.execute("UPDATE experimento SET configuracion_json=? WHERE id=?", (texto, experimento_id))
+
+    def comprobar_configuracion_publica(self, respuesta, registro, efectiva, predeterminada):
+        self.assertEqual(respuesta.status_code, 200, respuesta.text)
+        self.assertEqual(respuesta.json(), {
+            "conjunto_id": 7, "serie": {"id": 83, "store_nbr": 17, "family": "PREPARED FOODS"},
+            "pronostico_id": registro["pronostico_id"], "experimento_id": registro["experimento_id"],
+            "fecha_corte": registro["fecha_corte"], "configuracion": efectiva,
+            "es_predeterminada": predeterminada,
+        })
+        self.assertEqual(set(respuesta.json()["configuracion"]),
+                         {"version_contrato", "tecnica", "parametros", "variables", "horizonte", "version_reglas"})
+        self.assertIs(respuesta.json()["es_predeterminada"], predeterminada)
+        for interno in ("configuracion_json", "historial", "sha256_observaciones", "hash_conjunto",
+                        "ruta_modelo", "versiones", "scikit_learn", "auditoria"):
+            self.assertNotIn(interno, respuesta.text)
+
+    def test_configuracion_de_cinco_experimentos_http_corresponde_a_cada_identificador(self):
+        casos = self.crear_cuatro_http()
+        casos.append((BASE, OMITIDA, self.crear()))
+        previas = {r["pronostico_id"]: self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}").json() for _, _, r in casos}
+        lista_previa = self.cliente.get(f"{PREFIJO}/series/83").json()
+        contenido, historicos = self.ruta.read_bytes(), self.datos.historicos()
+        for tecnica, solicitud, r in casos:
+            efectiva = configuraciones.normalizar_configuracion({"tecnica": tecnica} if solicitud is OMITIDA else solicitud)
+            self.comprobar_configuracion_publica(self.obtener_configuracion(r["pronostico_id"]), r, efectiva, solicitud is OMITIDA)
+            self.assertEqual(self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}").json(), previas[r["pronostico_id"]])
+        self.assertEqual(self.cliente.get(f"{PREFIJO}/series/83").json(), lista_previa)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.datos.historicos(), historicos)
+        self.assertEqual(self.datos.conteos(), (5, 5, 75, 0, 0))
+        self.assertEqual(self.datos.consultar("PRAGMA foreign_key_check"), [])
+
+    def test_configuracion_max_features_entero_y_real_distinguen_tipos_y_defaults(self):
+        identificadores = []
+        for valor, predeterminada in ((1, False), (1.0, True)):
+            c = {"tecnica": "random_forest", "parametros": {"max_features": valor}}
+            r = self.crear("random_forest", configuracion=c)
+            respuesta = self.obtener_configuracion(r["pronostico_id"])
+            self.comprobar_configuracion_publica(respuesta, r, configuraciones.normalizar_configuracion(c), predeterminada)
+            self.assertIs(type(respuesta.json()["configuracion"]["parametros"]["max_features"]), type(valor))
+            self.assertIs(type(respuesta.json()["configuracion"]["parametros"]["bootstrap"]), bool)
+            self.assertIsNone(respuesta.json()["configuracion"]["parametros"]["max_depth"])
+            identificadores.append(r["experimento_id"])
+        self.assertNotEqual(*identificadores)
+
+    def test_configuracion_explicita_equivalente_a_defaults_de_tres_tecnicas(self):
+        for t in (BASE, "random_forest", "hist_gradient_boosting"):
+            c = configuraciones.configuracion_predeterminada(t)
+            r = self.crear(t, configuracion=c)
+            self.comprobar_configuracion_publica(self.obtener_configuracion(r["pronostico_id"]), r, c, True)
+
+    def test_configuracion_formatos_1_y_2_no_se_migran_y_gets_antiguos_siguen_iguales(self):
+        for t in (BASE, "random_forest", "hist_gradient_boosting"):
+            r = self.crear(t)
+            actual = self.datos.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (r["experimento_id"],))[0][0]
+            previa = self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}").json()
+            for version in (1, 2):
+                with self.subTest(tecnica=t, version=version):
+                    if version == 1:
+                        texto = self.datos.convertir_a_formato_antiguo(r["experimento_id"])
+                    else:
+                        texto = actual
+                        self.guardar_json_de_prueba(r["experimento_id"], texto)
+                    contenido = self.ruta.read_bytes()
+                    self.comprobar_configuracion_publica(self.obtener_configuracion(r["pronostico_id"]), r,
+                                                         configuraciones.configuracion_predeterminada(t), True)
+                    self.assertEqual(self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}").json(), previa)
+                    self.assertEqual(self.datos.consultar("SELECT configuracion_json FROM experimento WHERE id=?",
+                                                         (r["experimento_id"],))[0][0], texto)
+                    self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_configuracion_json_malformado_constantes_y_claves_ambiguas_son_409(self):
+        r = self.crear()
+        texto = self.datos.consultar("SELECT configuracion_json FROM experimento")[0][0]
+        casos = ['{"PRIVADO C:/secreto":', "null", "[]", '"C:/PRIVADO"', "",
+                 texto[:-1] + ',"tecnica":"random_forest"}',
+                 texto.replace('"respaldos_directos": 0', '"respaldos_directos": NaN')]
+        for invalido in casos:
+            with self.subTest(texto=invalido):
+                self.guardar_json_de_prueba(r["experimento_id"], invalido)
+                contenido = self.ruta.read_bytes()
+                respuesta = self.obtener_configuracion(r["pronostico_id"])
+                self.assertEqual(respuesta.status_code, 409, respuesta.text)
+                self.assertEqual(respuesta.json()["detail"]["codigo"], "pronostico_corrupto")
+                self.assertNotIn("PRIVADO", respuesta.text)
+                self.assertNotIn("SELECT", respuesta.text)
+                # El GET anterior no interpretaba JSON: no cambiar ese contrato.
+                self.assertEqual(self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}").status_code, 200)
+                self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_configuracion_contrato_parametros_y_reglas_no_reconocibles_son_409(self):
+        r = self.crear()
+        original = json.loads(self.datos.consultar("SELECT configuracion_json FROM experimento")[0][0])
+        casos = []
+        for campo, valor in (("version_registro", 99), ("parametros", {}), ("reglas", {})):
+            c = deepcopy(original)
+            c[campo] = valor
+            casos.append(c)
+        for campo, valor in (("version_contrato", 2), ("version_reglas", 2), ("horizonte", 30)):
+            c = deepcopy(original)
+            c["configuracion_predictiva"][campo] = valor
+            casos.append(c)
+        c = deepcopy(original)
+        c["parametros"]["periodo_estacional_dias"] = 14
+        casos.append(c)
+        c = deepcopy(original)
+        c["reglas"]["referencia"] = "PRIVADO SELECT otro comportamiento"
+        casos.append(c)
+        c = deepcopy(original)
+        c["version_registro"] = 1
+        del c["configuracion_predictiva"]
+        del c["parametros"]["periodo_estacional_dias"]
+        casos.append(c)
+        for c in casos:
+            with self.subTest(configuracion=c):
+                self.guardar_json_de_prueba(r["experimento_id"], json.dumps(c))
+                contenido = self.ruta.read_bytes()
+                respuesta = self.obtener_configuracion(r["pronostico_id"])
+                self.assertEqual(respuesta.status_code, 409, respuesta.text)
+                self.assertEqual(respuesta.json()["detail"]["codigo"], "pronostico_corrupto")
+                self.assertNotIn("PRIVADO", respuesta.text)
+                self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_configuracion_tecnica_contradictoria_con_experimento_no_elige_otro(self):
+        base = self.crear()
+        rf = self.crear("random_forest", configuracion={"tecnica": "random_forest", "parametros": {"n_estimators": 20}})
+        texto = self.datos.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (rf["experimento_id"],))[0][0]
+        self.guardar_json_de_prueba(base["experimento_id"], texto)
+        contenido = self.ruta.read_bytes()
+        respuesta = self.obtener_configuracion(base["pronostico_id"])
+        self.assertEqual(respuesta.status_code, 409)
+        self.assertEqual(respuesta.json()["detail"]["codigo"], "pronostico_corrupto")
+        self.assertEqual(self.obtener_configuracion(rf["pronostico_id"]).json()["experimento_id"], rf["experimento_id"])
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_configuracion_conserva_integridad_de_cabecera_y_quince_detalles(self):
+        r = self.crear()
+        for columna, valor in (("fecha_corte", "fecha inválida"), ("horizonte", 14),
+                                ("fecha_generacion", "PRIVADO"), ("duracion_segundos", float("inf"))):
+            anterior = self.datos.consultar(f"SELECT {columna} FROM pronostico")[0][0]
+            with closing(conectar(self.ruta)) as c, c:
+                c.execute("PRAGMA ignore_check_constraints=ON")
+                c.execute(f"UPDATE pronostico SET {columna}=?", (valor,))
+            self.assertEqual(self.obtener_configuracion(r["pronostico_id"]).status_code, 409)
+            self.assertEqual(self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}").status_code, 409)
+            self.datos.consultar(f"UPDATE pronostico SET {columna}=?", (anterior,))
+        for columna, valor in (("fecha_objetivo", "2018-01-01"), ("venta_estimada", -1)):
+            anterior = self.datos.consultar(f"SELECT {columna} FROM detalle_pronostico WHERE paso=1")[0][0]
+            self.datos.consultar(f"UPDATE detalle_pronostico SET {columna}=? WHERE paso=1", (valor,))
+            self.assertEqual(self.obtener_configuracion(r["pronostico_id"]).status_code, 409)
+            self.datos.consultar(f"UPDATE detalle_pronostico SET {columna}=? WHERE paso=1", (anterior,))
+        self.datos.consultar("DELETE FROM detalle_pronostico WHERE paso=15")
+        contenido = self.ruta.read_bytes()
+        self.assertEqual(self.obtener_configuracion(r["pronostico_id"]).status_code, 409)
+        self.assertEqual(self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}").status_code, 409)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_configuracion_inexistente_inactiva_y_sin_conjunto_activo(self):
+        r = self.crear()
+        respuesta = self.obtener_configuracion(999)
+        self.assertEqual(respuesta.status_code, 404)
+        self.assertEqual(respuesta.json()["detail"]["codigo"], "pronostico_inexistente")
+        with closing(conectar(self.ruta)) as c, c:
+            c.execute("UPDATE conjunto_datos SET activo=0 WHERE id=7")
+            c.execute("UPDATE conjunto_datos SET activo=1 WHERE id=2")
+        respuesta = self.obtener_configuracion(r["pronostico_id"])
+        self.assertEqual(respuesta.status_code, 404)
+        self.assertNotIn("PREPARED FOODS", respuesta.text)
+        self.datos.consultar("UPDATE conjunto_datos SET activo=0")
+        respuesta = self.obtener_configuracion(r["pronostico_id"])
+        self.assertEqual(respuesta.status_code, 409)
+        self.assertEqual(respuesta.json()["detail"]["codigo"], "sin_conjunto_activo")
+
+    def test_configuracion_base_ausente_danada_y_sin_esquema_503_sin_creacion(self):
+        ausente = self.ruta.with_name("ausente.sqlite3")
+        vacia = self.ruta.with_name("vacia.sqlite3")
+        danada = self.ruta.with_name("danada.sqlite3")
+        vacia.touch()
+        danada.write_bytes(b"BASE PRIVADA NO VALIDA")
+        for ruta in (ausente, vacia, danada):
+            app.dependency_overrides[obtener_ruta_base] = lambda ruta=ruta: ruta
+            respuesta = self.obtener_configuracion(1)
+            self.assertEqual(respuesta.status_code, 503, respuesta.text)
+            self.assertEqual(respuesta.json()["detail"]["codigo"], "base_no_disponible")
+            self.assertNotIn(str(ruta), respuesta.text)
+            self.assertNotIn("PRIVADA", respuesta.text)
+            self.assertNotIn("SELECT", respuesta.text)
+        self.assertFalse(ausente.exists())
+        self.assertEqual(vacia.stat().st_size, 0)
+
+    def test_configuracion_es_ro_sin_entrenar_registrar_ni_exponer_auditoria(self):
+        r = self.crear("random_forest", configuracion={"tecnica": "random_forest", "parametros": {"n_estimators": 20}})
+        texto = self.datos.consultar("SELECT configuracion_json FROM experimento")[0][0]
+        c = json.loads(texto)
+        c["versiones"]["python"] = "PRIVADO C:/python"
+        c["auditoria"]["ruta"] = "PRIVADO C:/auditoria"
+        c["historial"]["sha256_observaciones"] = "HUELLA PRIVADA"
+        self.guardar_json_de_prueba(r["experimento_id"], json.dumps(c))
+        self.datos.consultar("UPDATE experimento SET ruta_modelo='PRIVADO C:/modelo.pkl'")
+        contenido, historicos = self.ruta.read_bytes(), self.datos.historicos()
+        conectar_original = sqlite3.connect
+        aperturas, sentencias = [], []
+
+        def observar(database, **kwargs):
+            aperturas.append((database, kwargs))
+            conexion = conectar_original(database, **kwargs)
+            conexion.set_trace_callback(sentencias.append)
+            return conexion
+
+        with patch.object(api, "registrar_pronostico") as registrar, \
+                patch.object(registro, "_calcular") as calcular, \
+                patch.object(fixtures.modelos, "entrenar_modelo") as entrenar, \
+                patch.object(fixtures.modelos, "crear_estimador") as crear, \
+                patch.object(fixtures.modelos, "pronosticar_recursivo") as predecir, \
+                patch.object(consulta.sqlite3, "connect", side_effect=observar):
+            respuesta = self.obtener_configuracion(r["pronostico_id"])
+            self.assertEqual(respuesta.status_code, 200, respuesta.text)
+            self.assertNotIn("PRIVADO", respuesta.text)
+            self.assertNotIn("HUELLA", respuesta.text)
+            for llamada in (registrar, calcular, entrenar, crear, predecir):
+                llamada.assert_not_called()
+        self.assertEqual(len(aperturas), 1)
+        self.assertTrue(aperturas[0][0].endswith("?mode=ro"))
+        self.assertTrue(aperturas[0][1]["uri"])
+        self.assertEqual(sentencias[0], "BEGIN")
+        self.assertFalse(any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) for s in sentencias))
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.datos.historicos(), historicos)
+
+    def test_configuracion_lee_una_instantanea_consistente_ante_cambio_de_activo(self):
+        r = self.crear()
+        self.datos.consultar("PRAGMA journal_mode=WAL")  # solo esta SQLite temporal permite el escritor intercalado
+        activo = consulta._activo
+
+        def cambiar(conexion):
+            conjunto = activo(conexion)
+            with closing(conectar(self.ruta)) as escritor, escritor:
+                escritor.execute("UPDATE conjunto_datos SET activo=0 WHERE id=7")
+                escritor.execute("UPDATE conjunto_datos SET activo=1 WHERE id=2")
+            return conjunto
+
+        with patch.object(consulta, "_activo", side_effect=cambiar):
+            respuesta = self.obtener_configuracion(r["pronostico_id"])
+        self.assertEqual(respuesta.status_code, 200, respuesta.text)
+        self.assertEqual(respuesta.json()["conjunto_id"], 7)
+        self.assertEqual(respuesta.json()["experimento_id"], r["experimento_id"])
+        self.assertEqual(self.obtener_configuracion(r["pronostico_id"]).status_code, 404)
+
+    def test_configuracion_errores_de_interpretacion_son_publicos_y_controlados(self):
+        r = self.crear()
+        contenido = self.ruta.read_bytes()
+        with patch.object(consulta.configuraciones, "recuperar_configuracion", side_effect=ValueError("PRIVADO SELECT C:/secreto")):
+            respuesta = self.obtener_configuracion(r["pronostico_id"])
+        self.assertEqual(respuesta.status_code, 409)
+        self.assertEqual(respuesta.json(), {"detail": {"codigo": "pronostico_corrupto",
+                                                     "mensaje": api.ERRORES["pronostico_corrupto"][1]}})
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_configuracion_openapi_publica_contrato_sin_consultar_en_arranque(self):
+        with patch.object(api, "consultar_configuracion_pronostico") as consultar, \
+                patch.object(consulta, "_conexion_lectura") as leer, \
+                patch.object(fixtures.modelos, "entrenar_modelo") as entrenar:
+            with TestClient(app) as cliente:
+                self.assertEqual(cliente.get("/docs").status_code, 200)
+                esquema = cliente.get("/openapi.json").json()
+                self.assertEqual(cliente.get("/health").json(), {"status": "ok"})
+            consultar.assert_not_called()
+            leer.assert_not_called()
+            entrenar.assert_not_called()
+        ruta = esquema["paths"]["/api/pronosticos/active/{pronostico_id}/configuracion"]
+        self.assertEqual(set(ruta), {"get"})
+        self.assertEqual(ruta["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                         "#/components/schemas/ConfiguracionPronostico")
+        self.assertTrue({"404", "409", "503"} <= set(ruta["get"]["responses"]))
+        publicos = esquema["components"]["schemas"]["ConfiguracionPredictiva"]["properties"]
+        self.assertEqual(set(publicos), {"version_contrato", "tecnica", "parametros", "variables", "horizonte", "version_reglas"})
 
     def test_get_serie_activa_sin_pronosticos(self):
         respuesta = self.cliente.get(f"{PREFIJO}/series/83")

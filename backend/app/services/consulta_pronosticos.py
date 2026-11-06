@@ -2,12 +2,14 @@
 
 from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta
+import json
 from math import isfinite
 from numbers import Real
 from pathlib import Path
 import sqlite3
 
 from scripts.analizar_periodo_seleccion import HORIZONTE_DIAS
+from backend.app.services import configuracion_experimentos as configuraciones
 
 
 class ErrorConsultaPronostico(ValueError):
@@ -96,37 +98,91 @@ def listar_pronosticos(ruta_base: str | Path, serie_id: int) -> dict:
                 "pronosticos": [_metadatos(fila) for fila in filas]}
 
 
+def _cabecera_activa(conexion, conjunto_id, pronostico_id):
+    fila = conexion.execute(
+        "SELECT p.id, p.experimento_id, e.tecnica, p.fecha_corte, p.tipo, p.horizonte, "
+        "p.fecha_generacion, e.inicio_entrenamiento, e.fin_entrenamiento, p.duracion_segundos, "
+        "s.id AS serie_id, s.store_nbr, s.family, e.configuracion_json FROM pronostico p "
+        "JOIN experimento e ON e.id = p.experimento_id "
+        "JOIN serie_temporal s ON s.id = e.serie_id "
+        "WHERE p.id = ? AND s.conjunto_id = ?", (pronostico_id, conjunto_id),
+    ).fetchone()
+    if fila is None:
+        raise ErrorConsultaPronostico("pronostico_inexistente", "El pronóstico no existe en el conjunto activo.")
+    return fila
+
+
+def _detalles_validos(conexion, pronostico_id, metadatos):
+    """Misma validación de HU004, compartida por los dos GET individuales."""
+    detalles = conexion.execute(
+        "SELECT paso, fecha_objetivo, venta_estimada FROM detalle_pronostico "
+        "WHERE pronostico_id = ? ORDER BY paso", (pronostico_id,),
+    ).fetchall()
+    if len(detalles) != HORIZONTE_DIAS:
+        raise _corrupto()
+    corte = _fecha(metadatos["fecha_corte"])
+    try:
+        for paso, detalle in enumerate(detalles, 1):
+            valor = detalle["venta_estimada"]
+            if (type(detalle["paso"]) is not int or detalle["paso"] != paso
+                    or _fecha(detalle["fecha_objetivo"]) != corte + timedelta(days=paso)
+                    or isinstance(valor, bool) or not isinstance(valor, Real)
+                    or not isfinite(valor) or valor < 0):
+                raise ValueError("Detalle inconsistente")
+    except (TypeError, ValueError, OverflowError) as error:
+        raise _corrupto() from error
+    return detalles
+
+
 def consultar_pronostico(ruta_base: str | Path, pronostico_id: int) -> dict:
     with _conexion_lectura(ruta_base) as conexion:
         conjunto_id = _activo(conexion)
-        fila = conexion.execute(
-            "SELECT p.id, p.experimento_id, e.tecnica, p.fecha_corte, p.tipo, p.horizonte, "
-            "p.fecha_generacion, e.inicio_entrenamiento, e.fin_entrenamiento, p.duracion_segundos, "
-            "s.id AS serie_id, s.store_nbr, s.family FROM pronostico p "
-            "JOIN experimento e ON e.id = p.experimento_id "
-            "JOIN serie_temporal s ON s.id = e.serie_id "
-            "WHERE p.id = ? AND s.conjunto_id = ?", (pronostico_id, conjunto_id),
-        ).fetchone()
-        if fila is None:
-            raise ErrorConsultaPronostico("pronostico_inexistente", "El pronóstico no existe en el conjunto activo.")
+        fila = _cabecera_activa(conexion, conjunto_id, pronostico_id)
         metadatos = _metadatos(fila)
-        detalles = conexion.execute(
-            "SELECT paso, fecha_objetivo, venta_estimada FROM detalle_pronostico "
-            "WHERE pronostico_id = ? ORDER BY paso", (pronostico_id,),
-        ).fetchall()
-        if len(detalles) != HORIZONTE_DIAS:
-            raise _corrupto()
-        corte = _fecha(metadatos["fecha_corte"])
-        try:
-            for paso, detalle in enumerate(detalles, 1):
-                valor = detalle["venta_estimada"]
-                if (type(detalle["paso"]) is not int or detalle["paso"] != paso
-                        or _fecha(detalle["fecha_objetivo"]) != corte + timedelta(days=paso)
-                        or isinstance(valor, bool) or not isinstance(valor, Real)
-                        or not isfinite(valor) or valor < 0):
-                    raise ValueError("Detalle inconsistente")
-        except (TypeError, ValueError, OverflowError) as error:
-            raise _corrupto() from error
+        detalles = _detalles_validos(conexion, pronostico_id, metadatos)
         return {"conjunto_id": conjunto_id,
                 "serie": {"id": fila["serie_id"], "store_nbr": fila["store_nbr"], "family": fila["family"]},
                 "pronostico": metadatos, "detalles": [dict(d) for d in detalles]}
+
+
+def _objeto_json_univoco(pares):
+    """No elegir el último valor de una clave repetida en un JSON almacenado."""
+    objeto = {}
+    for clave, valor in pares:
+        if clave in objeto:
+            raise ValueError("Clave JSON ambigua.")
+        objeto[clave] = valor
+    return objeto
+
+
+def consultar_configuracion_pronostico(ruta_base: str | Path, pronostico_id: int) -> dict:
+    """Publica solo la configuración predictiva reconocida por F2, sin migrarla.
+
+    Activo, cabecera, detalles y JSON se leen en la misma transacción ro. No se
+    reconstruyen modelos ni se consulta el histórico para recalcular resultados.
+    """
+    with _conexion_lectura(ruta_base) as conexion:
+        conjunto_id = _activo(conexion)
+        fila = _cabecera_activa(conexion, conjunto_id, pronostico_id)
+        metadatos = _metadatos(fila)
+        _detalles_validos(conexion, pronostico_id, metadatos)
+        try:
+            almacenada = json.loads(fila["configuracion_json"], object_pairs_hook=_objeto_json_univoco)
+            json.dumps(almacenada, allow_nan=False)  # rechazar constantes no JSON también en auditoría
+            efectiva = configuraciones.recuperar_configuracion(almacenada)
+            if (efectiva["tecnica"] != metadatos["tecnica"]
+                    or efectiva["horizonte"] != metadatos["horizonte"]
+                    or metadatos["id"] != pronostico_id
+                    or type(metadatos["experimento_id"]) is not int or metadatos["experimento_id"] <= 0):
+                raise ValueError("Configuración inconsistente con la cabecera.")
+            predeterminada = configuraciones.configuracion_predeterminada(efectiva["tecnica"])
+            es_predeterminada = (configuraciones.identidad_configuracion(efectiva)
+                                 == configuraciones.identidad_configuracion(predeterminada))
+        except (ValueError, TypeError, OverflowError, RecursionError) as error:
+            raise _corrupto() from error
+        publicos = ("version_contrato", "tecnica", "parametros", "variables", "horizonte", "version_reglas")
+        return {"conjunto_id": conjunto_id,
+                "serie": {"id": fila["serie_id"], "store_nbr": fila["store_nbr"], "family": fila["family"]},
+                "pronostico_id": metadatos["id"], "experimento_id": metadatos["experimento_id"],
+                "fecha_corte": metadatos["fecha_corte"],
+                "configuracion": {k: efectiva[k] for k in publicos}, "es_predeterminada": es_predeterminada}

@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend.app.api.datasets import obtener_ruta_base
 from backend.app.services import configuracion_experimentos as configuraciones
 from backend.app.services.consulta_pronosticos import (
-    ErrorConsultaPronostico, consultar_pronostico, listar_pronosticos,
+    ErrorConsultaPronostico, consultar_configuracion_pronostico, consultar_pronostico, listar_pronosticos,
 )
 from backend.app.services.registro_pronosticos import (
     TECNICAS, ErrorRegistroPronostico, registrar_pronostico,
@@ -141,6 +141,28 @@ class RegistroPronostico(BaseModel):
     reutilizado: bool
 
 
+class ConfiguracionPredictiva(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version_contrato: int
+    tecnica: str
+    parametros: dict[str, Any]  # conservar int/float/bool/null normalizados por F2
+    variables: list[str]
+    horizonte: int
+    version_reglas: int
+
+
+class ConfiguracionPronostico(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    conjunto_id: int
+    serie: Serie
+    pronostico_id: int
+    experimento_id: int
+    fecha_corte: str
+    configuracion: ConfiguracionPredictiva
+    es_predeterminada: bool = Field(description="Equivalencia con los parámetros efectivos predeterminados; "
+                                               "no indica cómo se formuló la solicitud original.")
+
+
 class DetalleError(BaseModel):
     codigo: str
     mensaje: str
@@ -170,6 +192,13 @@ def listar(serie_id: Identificador, ruta_base: Path = Depends(obtener_ruta_base)
 def detalle(pronostico_id: Identificador, ruta_base: Path = Depends(obtener_ruta_base)):
     """Consulta un pronóstico completo y valida su integridad sin generar datos."""
     return consultar_pronostico(ruta_base, pronostico_id)
+
+
+@router.get("/active/{pronostico_id}/configuracion", response_model=ConfiguracionPronostico,
+            responses=RESPUESTAS_ERROR)
+def configuracion_guardada(pronostico_id: Identificador, ruta_base: Path = Depends(obtener_ruta_base)):
+    """Consulta la configuración efectiva del experimento en el conjunto activo, sin entrenar."""
+    return consultar_configuracion_pronostico(ruta_base, pronostico_id)
 
 
 @router.post("/active/series/{serie_id}", status_code=201, response_model=RegistroPronostico,
