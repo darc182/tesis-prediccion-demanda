@@ -10,12 +10,14 @@ from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Path as ParametroRuta, Query, UploadFile
 from fastapi.responses import JSONResponse
 
 from backend.app.services.carga_datos import (
     CodigoFalloCarga, ResultadoCargaDatos, cargar_csv,
 )
+from backend.app.services.perfil_series import CORTES_AUTORIZADOS, ErrorPerfilSerie, perfilar_serie
+from backend.app.services.validacion_csv import MAX_ENTERO_SQLITE
 
 
 RAIZ = Path(__file__).resolve().parents[3]
@@ -23,6 +25,23 @@ TAMANO_COPIA = 1024 * 1024
 NOMBRES_RESERVADOS = {"CON", "PRN", "AUX", "NUL"} | {
     f"{prefijo}{numero}" for prefijo in ("COM", "LPT") for numero in range(1, 10)
 }
+
+# Frontera HTTP del perfil: mensajes fijos, nunca str(error) ni cambios a G2.
+_ERRORES_PERFIL = {
+    "serie_invalida": (422, "El identificador de serie debe ser un entero positivo válido."),
+    "corte_invalido": (422, "La fecha de corte debe ser real y canónica YYYY-MM-DD."),
+    "corte_no_autorizado": (422, "El corte no está autorizado para perfilar la serie."),
+    "prueba_reservada": (422, "La prueba final permanece reservada."),
+    "serie_inexistente": (404, "La serie no existe en el conjunto activo."),
+    "sin_conjunto_activo": (409, "No existe un conjunto de datos activo."),
+    "historial_insuficiente": (409, "La serie no tiene observaciones hasta el corte solicitado."),
+    "datos_inconsistentes": (409, "La serie contiene observaciones o metadatos inconsistentes."),
+    "limite_observaciones": (409, "La serie excede el límite de observaciones permitido."),
+    "periodo_excesivo": (409, "El periodo de cobertura excede el límite permitido."),
+    "resultado_no_finito": (409, "Los datos no permiten obtener estadísticas finitas."),
+    "base_no_disponible": (503, "La base de datos no está disponible o no tiene el esquema necesario."),
+}
+_ERROR_INTERNO_PERFIL = (500, "No se pudo obtener el perfil solicitado.")
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
 
@@ -176,6 +195,34 @@ def consultar_ventas_historicas(
             for _, _, _, _, fecha, sales, onpromotion in filas if fecha is not None
         ],
     }
+
+
+@router.get("/active/series/{serie_id}/perfil", responses={
+    200: {"description": "Reporte G2 íntegro: cobertura, ventas, estacionalidad, promociones y valores extremos."},
+    422: {"description": "Identificador o corte inválido; fecha_corte es obligatorio."},
+    404: {"description": "Serie inexistente en el conjunto activo."},
+    409: {"description": "Sin conjunto activo, histórico insuficiente o datos no utilizables."},
+    503: {"description": "Base no disponible."},
+    500: {"description": "Error interno sin detalles técnicos."},
+})
+def consultar_perfil_serie(
+    serie_id: int = ParametroRuta(gt=0, le=MAX_ENTERO_SQLITE),
+    fecha_corte: str = Query(..., description="Corte obligatorio y canónico YYYY-MM-DD.",
+                             json_schema_extra={"enum": [c.isoformat() for c in CORTES_AUTORIZADOS]}),
+    ruta_base: Path = Depends(obtener_ruta_base),
+) -> dict:
+    """Delega una sola consulta a G2; conserva campos, precisión, null y orden."""
+    try:
+        return perfilar_serie(ruta_base, serie_id, fecha_corte)
+    except ErrorPerfilSerie as error:
+        estado, mensaje = _ERRORES_PERFIL.get(error.codigo, _ERROR_INTERNO_PERFIL)
+        raise HTTPException(status_code=estado, detail=mensaje) from error
+    except (sqlite3.Error, OSError) as error:
+        estado, mensaje = _ERRORES_PERFIL["base_no_disponible"]
+        raise HTTPException(status_code=estado, detail=mensaje) from error
+    except Exception as error:
+        estado, mensaje = _ERROR_INTERNO_PERFIL
+        raise HTTPException(status_code=estado, detail=mensaje) from error
 
 
 @router.post("/upload")
