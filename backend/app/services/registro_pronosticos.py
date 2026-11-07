@@ -213,6 +213,23 @@ def _contenido_config(config):
     return configuracion.identidad_configuracion(configuracion.recuperar_configuracion(config))
 
 
+def _leer_configuracion_estricta(texto):
+    """Lee sin resolver claves ambiguas ni admitir infinitos en la auditoría."""
+    def objeto_univoco(pares):
+        objeto = {}
+        for clave, valor in pares:
+            if clave in objeto:
+                raise ValueError("Clave JSON duplicada.")
+            objeto[clave] = valor
+        return objeto
+
+    guardada = json.loads(texto, object_pairs_hook=objeto_univoco)
+    # Incluye NaN/Infinity aceptados por el lector y desbordamientos como 1e309.
+    # Solo valida en memoria: nunca sanea ni reescribe el texto almacenado.
+    json.dumps(guardada, allow_nan=False)
+    return guardada
+
+
 def _buscar_identico(conexion, serie_id, tecnica, corte, config, inicio, fin, detalles):
     existentes = conexion.execute(
         "SELECT e.id, p.id, e.configuracion_json, e.inicio_entrenamiento, "
@@ -225,11 +242,11 @@ def _buscar_identico(conexion, serie_id, tecnica, corte, config, inicio, fin, de
     coincidencias = []
     for fila in existentes:
         try:
-            guardada = json.loads(fila[2])
+            guardada = _leer_configuracion_estricta(fila[2])
             if not isinstance(guardada, dict) or guardada.get("tecnica") != tecnica:
                 raise ValueError("Técnica almacenada inconsistente con el experimento.")
             misma_config = _contenido_config(guardada) == contenido
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError, RecursionError):
             raise ErrorRegistroPronostico(
                 "conflicto", "No se puede reconstruir con seguridad la identidad de un pronóstico almacenado.")
         if misma_config:

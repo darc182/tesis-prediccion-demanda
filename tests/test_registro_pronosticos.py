@@ -412,6 +412,29 @@ class RegistroPronosticosTests(unittest.TestCase):
         self.assertEqual(self.ruta.read_bytes(), contenido)
         self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
 
+    def test_candidata_corrupta_impide_reutilizar_otra_o_insertar_nueva_configuracion(self):
+        # Dobles SINTÉTICOS F1: se prueba la búsqueda, no el entrenamiento.
+        calculos = {nombre: self.resultado_config(nombre) for nombre in ("A", "B", "C")}
+        registros = {nombre: self.registrar_resultado(calculos[nombre]) for nombre in ("A", "B")}
+        for corrupta, solicitada in (("B", "A"), ("A", "B")):
+            eid = registros[corrupta].experimento_id
+            original = self.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (eid,))[0][0]
+            # JSON válido para SQLite, pero con una clave de auditoría repetida.
+            ambiguo = '{"auditoria": {"x": 1, "x": 1}, ' + original[1:]
+            self.consultar("UPDATE experimento SET configuracion_json=? WHERE id=?", (ambiguo, eid))
+            try:
+                anterior = self.ruta.read_bytes()
+                for nombre in (solicitada, "C"):
+                    with self.subTest(corrupta=corrupta, solicitada=nombre):
+                        with self.assertRaises(registro.ErrorRegistroPronostico) as error:
+                            self.registrar_resultado(calculos[nombre])
+                        self.assertEqual(error.exception.codigo, "conflicto")
+                        self.assertEqual(self.ruta.read_bytes(), anterior)
+                        self.assertEqual(self.conteos(), (2, 2, 30, 0, 0))
+            finally:
+                self.consultar("UPDATE experimento SET configuracion_json=? WHERE id=?", (original, eid))
+        self.assertEqual(self.consultar("PRAGMA foreign_key_check"), [])
+
     def convertir_a_formato_antiguo(self, experimento_id):
         texto = self.consultar("SELECT configuracion_json FROM experimento WHERE id=?",
                                (experimento_id,))[0][0]
