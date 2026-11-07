@@ -618,3 +618,65 @@
   color: var(--text-h);
   font-family: var(--mono);
 }
+
+/* Perfil G3-B: todos los estilos nuevos quedan limitados a este panel. */
+.profile-card {
+  margin-top: 24px;
+  padding: clamp(20px, 4vw, 32px);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  line-height: 1.5;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.profile-card h2 { margin: 0 0 16px; }
+.profile-card strong { color: var(--text-h); }
+.profile-context { margin-bottom: 20px; }
+.profile-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px 16px; align-items: end; }
+.profile-form label { display: block; margin-bottom: 8px; color: var(--text-h); font-weight: 600; }
+.profile-form select { width: 100%; min-width: 0; box-sizing: border-box; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text-h); font: inherit; }
+.profile-form .help-text { grid-column: 1 / -1; }
+.profile-card button { padding: 10px 14px; border: 1px solid var(--accent-border); border-radius: 7px; background: var(--accent-bg); color: var(--text-h); font: inherit; cursor: pointer; }
+.profile-card button:disabled { opacity: 0.65; cursor: default; }
+.profile-card button:hover:not(:disabled) { border-color: var(--accent); }
+.profile-card :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.profile-message { margin-top: 20px; padding: 14px; border: 1px solid var(--border); border-radius: 8px; }
+.profile-error { border-color: var(--accent-border); border-style: dashed; color: var(--text-h); }
+.profile-error p { margin-top: 8px; }
+.profile-period { margin: 24px 0 16px; }
+.profile-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); gap: 12px; margin: 16px 0; }
+.profile-metrics > div { padding: 12px; border: 1px solid var(--border); border-radius: 8px; min-width: 0; }
+.profile-metrics dt { font-size: 0.85rem; }
+.profile-metrics dd { margin: 6px 0 0; color: var(--text-h); font-size: 1.15rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.profile-metrics time { font-size: 1rem; }
+.profile-note { margin: 12px 0; font-size: 0.88rem; }
+.profile-section { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.profile-section > summary { padding: 4px 0; font-weight: 600; color: var(--text-h); cursor: pointer; }
+.profile-section[open] > summary { margin-bottom: 16px; }
+.profile-section ul { padding-left: 22px; }
+.profile-section li + li { margin-top: 8px; }
+.profile-bars { margin: 20px 0 28px; }
+.profile-bars figcaption { display: grid; gap: 4px; margin-bottom: 16px; }
+.profile-bars figcaption span { font-size: 0.85rem; }
+.profile-bars ul { list-style: none; padding: 0; margin: 0; }
+.profile-bars li { margin-bottom: 16px; }
+.profile-bar-label { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 16px; margin-bottom: 6px; font-variant-numeric: tabular-nums; }
+.profile-bar-track { height: 12px; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+.profile-bar-track > span { display: block; height: 100%; background: var(--accent); }
+.profile-bars .help-text { margin-top: 6px; }
+.profile-table-wrap { max-width: 100%; overflow-x: auto; margin: 16px 0; }
+.profile-table-wrap table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.profile-table-wrap caption { text-align: left; margin-bottom: 10px; font-weight: 600; color: var(--text-h); }
+.profile-table-wrap th, .profile-table-wrap td { padding: 9px 12px; border-bottom: 1px solid var(--border); text-align: left; }
+.profile-table-wrap th { color: var(--text-h); }
+.profile-table-wrap td { white-space: nowrap; }
+.profile-missing { display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 8px 20px; }
+.profile-section .profile-missing li { margin: 0; }
+.profile-pagination { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+.profile-pagination span { font-size: 0.85rem; }
+@media (max-width: 560px) {
+  .profile-form { grid-template-columns: minmax(0, 1fr); }
+  .profile-form button { width: 100%; }
+  .profile-pagination { justify-content: flex-start; }
+  .profile-pagination span { flex-basis: 100%; order: -1; }
+}

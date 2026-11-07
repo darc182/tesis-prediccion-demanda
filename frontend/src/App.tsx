@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import HistoricoVentas from './components/HistoricoVentas'
+import PerfilSerie from './components/PerfilSerie'
 import PronosticosVentas from './components/PronosticosVentas'
 import SelectorSerie, { type SerieTemporal, type SeriesState } from './components/SelectorSerie'
 import './App.css'
@@ -404,6 +405,11 @@ function App() {
         />
         <HistoricoVentas
           key={seleccionHistorico ? `${seleccionHistorico.conjuntoId}:${seleccionHistorico.serie.id}` : 'sin-serie'}
+          seleccion={seleccionHistorico}
+          activo={vista === 'historico'}
+        />
+        <PerfilSerie
+          key={seleccionHistorico ? `perfil:${seleccionHistorico.conjuntoId}:${seleccionHistorico.serie.id}` : 'perfil-sin-serie'}
           seleccion={seleccionHistorico}
           activo={vista === 'historico'}
         />
