@@ -2,7 +2,10 @@
 
 El CSV se copia antes de validarlo: la importación lee esa misma copia. Los
 conjuntos anteriores permanecen en la base y el nuevo se activa solo al final
-de una transacción que incluye todas las inserciones.
+de una transacción que incluye ventas y perfil del CSV completo. G1 y su
+preparación se ejecutan antes de adquirir el bloqueo de escritura.
+Tras importar se relee la copia por bloques bajo ese bloqueo para verificar
+su SHA-256 antes de guardar el perfil y activar el conjunto.
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ import csv
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -18,16 +22,34 @@ import sqlite3
 from tempfile import TemporaryDirectory
 from typing import Literal, TypeAlias
 
-from backend.app.services.validacion_csv import validar_csv
-from backend.app.storage.db import conectar
+from backend.app.services.validacion_csv import TAMANO_HASH, validar_csv
+from backend.app.services.perfil_global_conjunto import (
+    ErrorPerfilGlobal, preparar_perfil_global, guardar_perfil_global,
+)
+from scripts.perfil_global_csv import ErrorPerfilCSV, perfilar_csv_global
 
 
 CONFIG_SERIES = Path(__file__).resolve().parents[3] / "config" / "series_seleccionadas.json"
 TAMANO_LOTE = 1_000
 CodigoFalloCarga: TypeAlias = Literal[
     "csv_invalido", "sin_series_utilizables", "base_no_disponible",
-    "configuracion_invalida", "fallo_interno",
+    "configuracion_invalida", "fallo_interno", "perfil_no_generable",
 ]
+_ERROR_BASE = "La base SQLite no está disponible o no tiene el esquema necesario."
+_ERROR_PERFIL = "No se pudo generar un perfil global válido para el archivo."
+_ERROR_INTERNO = "No se pudo completar la carga de datos."
+
+
+class _ErrorIdentidadCopia(RuntimeError):
+    """La copia consumida ya no coincide con la identidad validada del CSV."""
+
+
+def _sha256_copia(ruta: Path) -> str:
+    huella = hashlib.sha256()
+    with ruta.open("rb") as archivo:
+        for bloque in iter(lambda: archivo.read(TAMANO_HASH), b""):
+            huella.update(bloque)
+    return huella.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -70,6 +92,32 @@ def _fallo(
     return ResultadoCargaDatos(False, None, sha256, 0, 0, (mensaje,), (), codigo_error)
 
 
+def _comprobar_almacenamiento(conexion: sqlite3.Connection) -> None:
+    """Solo lectura; se repite bajo BEGIN IMMEDIATE, sin inicializar tablas."""
+    columnas = {
+        "conjunto_datos": "id,nombre_archivo,hash,fecha_carga,activo",
+        "serie_temporal": "id,conjunto_id,store_nbr,family,criterio_seleccion",
+        "venta_diaria": "id,serie_id,fecha,sales,onpromotion",
+        "perfil_global_conjunto": "conjunto_id,version_perfil,sha256_csv,reporte_json,sha256_reporte,series_importadas,observaciones_importadas",
+    }
+    tablas = {f[0] for f in conexion.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not columnas.keys() <= tablas:
+        raise sqlite3.DatabaseError("Esquema de carga incompleto")
+    for tabla, campos in columnas.items():
+        conexion.execute(f"SELECT {campos} FROM {tabla} LIMIT 0")
+
+
+def _abrir_escritura(ruta: Path) -> sqlite3.Connection:
+    # rw impide crear una base si desaparece después de la comprobación previa.
+    conexion = sqlite3.connect(f"{ruta.resolve().as_uri()}?mode=rw", uri=True)
+    try:
+        conexion.execute("PRAGMA foreign_keys=ON")
+        return conexion
+    except Exception:
+        conexion.close()
+        raise
+
+
 def cargar_csv(
     ruta_csv: str | Path,
     ruta_base: str | Path,
@@ -78,8 +126,8 @@ def cargar_csv(
 ) -> ResultadoCargaDatos:
     """Valida una copia y carga solo las observaciones de series habilitadas.
 
-    La base debe existir y tener el esquema inicializado. Cualquier fallo en
-    la importación o activación revierte el conjunto nuevo y deja el anterior.
+    La base y la tabla de perfiles deben existir. Cualquier fallo al importar,
+    guardar el perfil o activar revierte el conjunto nuevo y deja el anterior.
     """
     if tamano_lote < 1:
         raise ValueError("tamano_lote debe ser positivo.")
@@ -87,11 +135,13 @@ def cargar_csv(
     ruta_base = Path(ruta_base)
     ruta_config = Path(ruta_config)
 
+    sha256 = None
     try:
         with TemporaryDirectory(prefix="carga_csv_") as temporal:
             copia = Path(temporal) / "datos.csv"
             shutil.copyfile(ruta_csv, copia)
             validacion = validar_csv(copia)
+            sha256 = validacion.sha256
             if not validacion.valido:
                 return ResultadoCargaDatos(
                     False, None, validacion.sha256, 0, 0,
@@ -100,17 +150,34 @@ def cargar_csv(
 
             try:
                 habilitadas = _series_habilitadas(ruta_config)
-            except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
-                return _fallo(f"No se pudo leer la configuración de series: {error}",
+            except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+                return _fallo("La configuración de series no es válida.",
                               "configuracion_invalida", validacion.sha256)
-            if not ruta_base.is_file():
-                return _fallo("La base SQLite no existe o no está inicializada.",
-                              "base_no_disponible", validacion.sha256)
+            try:
+                with closing(sqlite3.connect(f"{ruta_base.resolve().as_uri()}?mode=ro", uri=True)) as lectura:
+                    _comprobar_almacenamiento(lectura)
+            except (OSError, ValueError, sqlite3.Error):
+                return _fallo(_ERROR_BASE, "base_no_disponible", sha256)
 
             try:
-                with closing(conectar(ruta_base)) as conexion:
+                reporte = perfilar_csv_global(copia)
+                preparado = preparar_perfil_global(reporte, ruta_csv.name)
+            except ErrorPerfilCSV:
+                return _fallo(_ERROR_PERFIL, "perfil_no_generable", sha256)
+            except ErrorPerfilGlobal as error:
+                if error.codigo in {"perfil_invalido", "perfil_demasiado_grande"}:
+                    return _fallo(_ERROR_PERFIL, "perfil_no_generable", sha256)
+                return _fallo(_ERROR_INTERNO, "fallo_interno", sha256)
+            if (reporte["volumen"]["filas_examinadas"] != validacion.registros_examinados
+                    or reporte["temporalidad"]["primera_fecha"] != validacion.fecha_minima
+                    or reporte["temporalidad"]["ultima_fecha"] != validacion.fecha_maxima):
+                return _fallo(_ERROR_INTERNO, "fallo_interno", sha256)
+
+            try:
+                with closing(_abrir_escritura(ruta_base)) as conexion:
                     try:
                         conexion.execute("BEGIN IMMEDIATE")
+                        _comprobar_almacenamiento(conexion)
                         cursor = conexion.execute(
                             "INSERT INTO conjunto_datos "
                             "(nombre_archivo, hash, fecha_carga, activo) "
@@ -166,6 +233,12 @@ def cargar_csv(
                             )
                             observaciones += len(lote)
 
+                        # Pasada final independiente, después de consumir/importar las
+                        # observaciones. Una divergencia revierte también las ventas.
+                        if _sha256_copia(copia) != validacion.sha256:
+                            raise _ErrorIdentidadCopia()
+                        guardar_perfil_global(conexion, conjunto_id, preparado, validacion.sha256,
+                                              len(ids_series), observaciones)
                         conexion.execute("UPDATE conjunto_datos SET activo = 0 WHERE activo = 1")
                         conexion.execute(
                             "UPDATE conjunto_datos SET activo = 1 WHERE id = ?",
@@ -176,14 +249,14 @@ def cargar_csv(
                         conexion.rollback()
                         codigo_error: CodigoFalloCarga = (
                             "base_no_disponible"
-                            if isinstance(error, sqlite3.DatabaseError)
-                            and not isinstance(error, sqlite3.IntegrityError)
+                            if (isinstance(error, sqlite3.DatabaseError) and not isinstance(error, sqlite3.IntegrityError))
+                            or (isinstance(error, ErrorPerfilGlobal) and error.codigo == "almacenamiento_no_disponible")
                             else "fallo_interno"
                         )
-                        return _fallo(f"La carga se revirtió por un error: {error}",
-                                      codigo_error, validacion.sha256)
-            except (OSError, sqlite3.Error) as error:
-                return _fallo(f"No se pudo abrir la base SQLite: {error}",
+                        return _fallo(_ERROR_BASE if codigo_error == "base_no_disponible" else _ERROR_INTERNO,
+                                      codigo_error, None if isinstance(error, _ErrorIdentidadCopia) else validacion.sha256)
+            except (OSError, sqlite3.Error):
+                return _fallo(_ERROR_BASE,
                               "base_no_disponible", validacion.sha256)
 
             ausentes = [
@@ -195,5 +268,5 @@ def cargar_csv(
                 True, conjunto_id, validacion.sha256, len(ids_series),
                 observaciones, (), tuple(ausentes),
             )
-    except (OSError, UnicodeError, ValueError) as error:
-        return _fallo(f"No se pudo preparar la carga: {error}", "fallo_interno")
+    except Exception:
+        return _fallo(_ERROR_INTERNO, "fallo_interno", sha256)

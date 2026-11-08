@@ -34,6 +34,12 @@ class PerfilGlobalConjuntoTests(unittest.TestCase):
         self.addCleanup(self.datos.doCleanups)
         self.datos.setUp()
         self.ruta = self.datos.ruta
+        # B2 carga un perfil obligatorio. Solo esta fixture lo retira para
+        # representar deliberadamente un conjunto legado SIN perfil y probar
+        # la inserción manual del servicio B1, sin desactivar G1 en producción.
+        with closing(conectar(self.ruta)) as legado, legado:
+            self.assertEqual(legado.execute("SELECT COUNT(*) FROM perfil_global_conjunto").fetchone(), (1,))
+            legado.execute("DELETE FROM perfil_global_conjunto WHERE conjunto_id=?", (self.datos.conjunto,))
         copia = self.ruta.with_name("datos.csv")
         copia.write_bytes(self.datos.contenido)
         self.original = g1.perfilar_csv_global(copia, 3)
@@ -510,7 +516,7 @@ class PerfilGlobalConjuntoTests(unittest.TestCase):
             self.assertEqual(c.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.error("perfil_no_disponible", lambda: servicio.recuperar_perfil_global(c, self.conjunto))
 
-    def test_no_modifica_pronosticos_y_la_carga_actual_no_genera_perfil(self):
+    def test_registro_manual_de_perfil_legado_no_modifica_pronosticos(self):
         self.assertEqual(self.c.execute("SELECT COUNT(*) FROM perfil_global_conjunto").fetchone(), (0,))
         self.c.rollback()
         self.datos.crear_base()

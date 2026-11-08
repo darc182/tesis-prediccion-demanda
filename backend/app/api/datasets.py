@@ -60,6 +60,7 @@ def _nombre_seguro(nombre: str | None) -> str | None:
     if (not base or len(base) > 255 or not base.lower().endswith(".csv")
             or not base[:-4].strip(" .")
             or base[:-4].strip(" .").upper() in NOMBRES_RESERVADOS
+            or base.split(".", 1)[0].strip(" .").upper() in NOMBRES_RESERVADOS
             or any(not (caracter.isalnum() or caracter in "._- ()") for caracter in base)):
         return None
     return base
@@ -90,6 +91,7 @@ def _respuesta_error(codigo_error: CodigoFalloCarga, mensaje: str) -> JSONRespon
 def _codigo_fallo(resultado: ResultadoCargaDatos) -> int:
     return {
         "csv_invalido": 422,
+        "perfil_no_generable": 422,
         "sin_series_utilizables": 422,
         "base_no_disponible": 503,
         "configuracion_invalida": 500,

@@ -42,7 +42,7 @@ class CargaDatosTests(unittest.TestCase):
     def cargar(self, lote: int = 2):
         return cargar_csv(self.csv, self.base, self.config, tamano_lote=lote)
 
-    def estado(self) -> tuple[list[tuple], list[tuple], list[tuple]]:
+    def estado(self) -> tuple[list[tuple], ...]:
         with closing(conectar(self.base)) as conexion:
             conjuntos = conexion.execute(
                 "SELECT id, hash, activo FROM conjunto_datos ORDER BY id"
@@ -55,7 +55,8 @@ class CargaDatosTests(unittest.TestCase):
                 "SELECT id, serie_id, fecha, sales, onpromotion "
                 "FROM venta_diaria ORDER BY id"
             ).fetchall()
-            return conjuntos, series, ventas
+            perfiles = conexion.execute("SELECT * FROM perfil_global_conjunto ORDER BY conjunto_id").fetchall()
+            return conjuntos, series, ventas, perfiles
 
     def test_primera_carga_con_ceros_fracciones_y_solo_series_habilitadas(self) -> None:
         self.escribir([
@@ -74,7 +75,8 @@ class CargaDatosTests(unittest.TestCase):
         self.assertEqual(len(resultado.advertencias), 8)
         self.assertEqual(self.csv.read_bytes(), origen)
 
-        conjuntos, series, ventas = self.estado()
+        conjuntos, series, ventas, perfiles = self.estado()
+        self.assertEqual(len(perfiles), 1)
         self.assertEqual(len(conjuntos), 1)
         self.assertEqual(conjuntos[0], (resultado.conjunto_id, resultado.sha256, 1))
         self.assertEqual({(s[2], s[3]) for s in series}, {PREPARADOS, PANADERIA})
@@ -105,7 +107,8 @@ class CargaDatosTests(unittest.TestCase):
         segundo = self.cargar()
         self.assertTrue(primero.exito and segundo.exito)
         self.assertNotEqual(primero.conjunto_id, segundo.conjunto_id)
-        conjuntos, series, ventas = self.estado()
+        conjuntos, series, ventas, perfiles = self.estado()
+        self.assertEqual(len(perfiles), 2)
         self.assertEqual([(c[0], c[2]) for c in conjuntos],
                          [(primero.conjunto_id, 0), (segundo.conjunto_id, 1)])
         self.assertEqual(len(series), 2)
@@ -129,7 +132,7 @@ class CargaDatosTests(unittest.TestCase):
         ])
         resultado = self.cargar(lote=1)
         self.assertFalse(resultado.exito)
-        self.assertIn("fallo simulado", resultado.errores[0])
+        self.assertEqual(resultado.errores, ("No se pudo completar la carga de datos.",))
         self.assertEqual(resultado.codigo_error, "fallo_interno")
         self.assertEqual(self.estado(), anterior)
 
@@ -147,7 +150,7 @@ class CargaDatosTests(unittest.TestCase):
         self.escribir([["2017-06-17", "8", "BREAD/BAKERY", "2", "0"]])
         resultado = self.cargar()
         self.assertFalse(resultado.exito)
-        self.assertIn("fallo simulado", resultado.errores[0])
+        self.assertEqual(resultado.errores, ("No se pudo completar la carga de datos.",))
         self.assertEqual(resultado.codigo_error, "fallo_interno")
         self.assertEqual(self.estado(), anterior)
 
@@ -208,7 +211,7 @@ class CargaDatosTests(unittest.TestCase):
         self.assertFalse(resultado.exito)
         self.assertEqual(resultado.codigo_error, "configuracion_invalida")
         self.assertTrue(resultado.errores)
-        self.assertEqual(self.estado(), ([], [], []))
+        self.assertEqual(self.estado(), ([], [], [], []))
 
 
 if __name__ == "__main__":

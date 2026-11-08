@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from backend.app.api.datasets import obtener_ruta_base
 from backend.app.main import app
 from backend.app.services.carga_datos import ResultadoCargaDatos, cargar_csv
+from backend.app.services.perfil_global_conjunto import recuperar_perfil_global
 from backend.app.storage.db import conectar, inicializar_base
 
 
@@ -89,6 +90,31 @@ class ApiCargaCSVTests(unittest.TestCase):
             self.assertEqual(conexion.execute(
                 "SELECT COUNT(*) FROM conjunto_datos"
             ).fetchone()[0], 0)
+
+    def test_reservados_con_extensiones_adicionales_se_rechazan_antes_de_escribir(self):
+        with patch.object(Path, "open", side_effect=AssertionError("escribe archivo reservado")), \
+                patch("backend.app.api.datasets.TemporaryDirectory") as temporal, \
+                patch("backend.app.api.datasets.cargar_csv") as carga:
+            for nombre in ("CON.test.csv", "COM1.extra.csv", "NUL.datos.csv", "LPT9.extra.csv", " con.test.csv"):
+                with self.subTest(nombre=nombre):
+                    r = self.subir(nombre=nombre)
+                    self.assertEqual(r.status_code, 422, r.text)
+                    self.assertFalse(r.json()["exito"])
+            temporal.assert_not_called()
+            carga.assert_not_called()
+
+    def test_nombres_validos_conservados_en_conjunto_y_perfil_real(self):
+        for nombre in ("ventas.csv", "ventas..csv", " ventas.csv", "Ventas Perú.csv", "ventas (copia).csv"):
+            with self.subTest(nombre=nombre):
+                r = self.subir(nombre=nombre)
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertEqual(set(r.json()), {"exito", "conjunto_id", "sha256", "series_importadas",
+                                                 "observaciones_importadas", "errores", "advertencias"})
+                with closing(conectar(self.base)) as c:
+                    c.execute("BEGIN")
+                    perfil = recuperar_perfil_global(c, r.json()["conjunto_id"])
+                    self.assertEqual(perfil["reporte"]["fuente"]["nombre_archivo"], nombre)
+                    self.assertEqual(perfil["sha256_csv"], r.json()["sha256"])
 
     def test_csv_invalido_y_archivo_vacio(self) -> None:
         invalido = CABECERA.encode("utf-8") + b"2017-06-16,17,PREPARED FOODS,-1,0\n"
@@ -186,6 +212,7 @@ class ApiCargaCSVTests(unittest.TestCase):
     def test_estado_http_depende_del_codigo_y_no_del_mensaje(self) -> None:
         esperado = {
             "csv_invalido": 422,
+            "perfil_no_generable": 422,
             "sin_series_utilizables": 422,
             "base_no_disponible": 503,
             "configuracion_invalida": 500,
