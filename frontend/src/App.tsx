@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import HistoricoVentas from './components/HistoricoVentas'
 import PerfilSerie from './components/PerfilSerie'
+import PerfilGlobalDatos from './components/PerfilGlobalDatos'
 import PronosticosVentas from './components/PronosticosVentas'
 import SelectorSerie, { type SerieTemporal, type SeriesState } from './components/SelectorSerie'
 import './App.css'
@@ -392,6 +393,13 @@ function App() {
             )}
           </section>
         )}
+        <PerfilGlobalDatos
+          key={seriesState.kind === 'available' ? `global:${seriesState.conjuntoId}` : 'global-sin-confirmar'}
+          conjuntoIdActivo={seriesState.kind === 'available' ? seriesState.conjuntoId : null}
+          estadoConjunto={seriesState.kind}
+          activo={vista === 'datos'}
+          actualizarSeries={handleRetrySeries}
+        />
       </section>
 
       <section className="app-view" aria-label="Histórico" hidden={vista !== 'historico'}>
