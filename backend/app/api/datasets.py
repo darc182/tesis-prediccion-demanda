@@ -17,6 +17,7 @@ from backend.app.services.carga_datos import (
     CodigoFalloCarga, ResultadoCargaDatos, cargar_csv,
 )
 from backend.app.services.perfil_series import CORTES_AUTORIZADOS, ErrorPerfilSerie, perfilar_serie
+from backend.app.services.perfil_global_conjunto import ErrorPerfilGlobal, recuperar_perfil_global
 from backend.app.services.validacion_csv import MAX_ENTERO_SQLITE
 
 
@@ -45,12 +46,53 @@ _ERROR_INTERNO_PERFIL = (500, "No se pudo obtener el perfil solicitado.")
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
 
+_ERRORES_PERFIL_GLOBAL = {
+    "perfil_no_disponible": (404, "El conjunto activo no dispone de un perfil global."),
+    "perfil_corrupto": (409, "El perfil global almacenado presenta inconsistencias."),
+    "perfil_invalido": (409, "El perfil global almacenado presenta inconsistencias."),
+    "version_no_soportada": (409, "La versión del perfil global no está soportada."),
+    "perfil_demasiado_grande": (409, "El perfil global almacenado excede el tamaño permitido."),
+    "almacenamiento_no_disponible": (503, "El almacenamiento del perfil global no está disponible."),
+}
+_ERROR_INTERNO_GLOBAL = (500, "No se pudo obtener el perfil global solicitado.")
+
 
 def obtener_ruta_base() -> Path:
     """Resuelve TESIS_DB_PATH desde la raíz si se proporciona una ruta relativa."""
     valor = os.environ.get("TESIS_DB_PATH") or "data/local/tesis.sqlite3"
     ruta = Path(valor)
     return ruta if ruta.is_absolute() else RAIZ / ruta
+
+
+@router.get("/active/perfil-global", responses={
+    200: {"description": "Procedencia y reporte G1 íntegro del conjunto activo."},
+    404: {"description": "Conjunto activo sin perfil global, incluido el esquema legado."},
+    409: {"description": "Sin conjunto activo, perfil inconsistente, excesivo o versión no soportada."},
+    503: {"description": "Almacenamiento no disponible."},
+    500: {"description": "Error interno sin detalles técnicos."},
+})
+def consultar_perfil_global(ruta_base: Path = Depends(obtener_ruta_base)) -> JSONResponse:
+    """Lee activo y perfil en una única instantánea; nunca reprocesa el CSV."""
+    cabeceras = {"Cache-Control": "no-store"}
+    try:
+        uri = f"{ruta_base.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conexion:
+            conexion.execute("BEGIN")
+            activo = conexion.execute(
+                "SELECT id FROM conjunto_datos WHERE activo = 1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if activo is None:
+                return JSONResponse(status_code=409, headers=cabeceras,
+                                    content={"detail": "No existe un conjunto de datos activo."})
+            contenido = recuperar_perfil_global(conexion, activo[0])
+            return JSONResponse(content=contenido, headers=cabeceras)
+    except ErrorPerfilGlobal as error:
+        estado, mensaje = _ERRORES_PERFIL_GLOBAL.get(error.codigo, _ERROR_INTERNO_GLOBAL)
+    except (sqlite3.Error, OSError):
+        estado, mensaje = _ERRORES_PERFIL_GLOBAL["almacenamiento_no_disponible"]
+    except Exception:
+        estado, mensaje = _ERROR_INTERNO_GLOBAL
+    return JSONResponse(status_code=estado, content={"detail": mensaje}, headers=cabeceras)
 
 
 def _nombre_seguro(nombre: str | None) -> str | None:
