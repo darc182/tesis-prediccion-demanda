@@ -79,4 +79,23 @@ CREATE TABLE IF NOT EXISTS simulacion (
     fecha TEXT NOT NULL
 );
 
+-- Identidad compartida explícita: nunca se autogenera un conjunto_id de perfil.
+CREATE TABLE IF NOT EXISTS perfil_global_conjunto (
+    conjunto_id INTEGER NOT NULL PRIMARY KEY REFERENCES conjunto_datos(id)
+        CHECK (typeof(conjunto_id) = 'integer' AND conjunto_id > 0),
+    version_perfil INTEGER NOT NULL
+        CHECK (typeof(version_perfil) = 'integer' AND version_perfil > 0),
+    sha256_csv TEXT NOT NULL
+        CHECK (typeof(sha256_csv) = 'text' AND length(sha256_csv) = 64 AND sha256_csv NOT GLOB '*[^0-9a-f]*'),
+    reporte_json TEXT NOT NULL
+        CHECK (typeof(reporte_json) = 'text' AND json_valid(reporte_json)
+               AND length(CAST(reporte_json AS BLOB)) <= 16777216),
+    sha256_reporte TEXT NOT NULL
+        CHECK (typeof(sha256_reporte) = 'text' AND length(sha256_reporte) = 64 AND sha256_reporte NOT GLOB '*[^0-9a-f]*'),
+    series_importadas INTEGER NOT NULL
+        CHECK (typeof(series_importadas) = 'integer' AND series_importadas >= 0),
+    observaciones_importadas INTEGER NOT NULL
+        CHECK (typeof(observaciones_importadas) = 'integer' AND observaciones_importadas >= 0)
+) WITHOUT ROWID;
+
 COMMIT;

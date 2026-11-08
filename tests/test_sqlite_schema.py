@@ -17,6 +17,7 @@ TABLAS = {
     "detalle_pronostico",
     "evaluacion",
     "simulacion",
+    "perfil_global_conjunto",
 }
 
 
@@ -56,7 +57,7 @@ class SQLiteSchemaTests(unittest.TestCase):
             (tipo,),
         )
 
-    def test_crea_exactamente_ocho_tablas(self) -> None:
+    def test_crea_exactamente_nueve_tablas(self) -> None:
         tablas = {
             fila[0]
             for fila in self.conexion.execute(
@@ -78,6 +79,7 @@ class SQLiteSchemaTests(unittest.TestCase):
             "detalle_pronostico": "pronostico",
             "evaluacion": "pronostico",
             "simulacion": "pronostico",
+            "perfil_global_conjunto": "conjunto_datos",
         }
         for tabla, padre in esperadas.items():
             with self.subTest(tabla=tabla):
@@ -113,6 +115,10 @@ class SQLiteSchemaTests(unittest.TestCase):
 
     def test_rechaza_referencias_inexistentes(self) -> None:
         inserciones = {
+            "perfil_global_conjunto": (
+                "INSERT INTO perfil_global_conjunto VALUES "
+                "(999,1,'" + "a" * 64 + "','{}','" + "b" * 64 + "',0,0)"
+            ),
             "serie_temporal": (
                 "INSERT INTO serie_temporal "
                 "(conjunto_id, store_nbr, family, criterio_seleccion) "
