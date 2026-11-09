@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from math import fsum, isfinite
 from pathlib import Path
@@ -30,6 +31,7 @@ from scripts.preparar_series_modelado import (
 
 
 COLUMNAS_PREDICTORAS = ("lag_1", "lag_7", "lag_14", "media_7", "dia_semana", "mes")
+COLUMNAS_PREDICTORAS_ALTERNATIVAS = (*COLUMNAS_PREDICTORAS, "media_14")
 COLUMNAS_TABLA = ("store_nbr", "family", "fecha_objetivo", *COLUMNAS_PREDICTORAS, "sales")
 
 
@@ -58,12 +60,24 @@ class ResultadoSerie:
     observaciones_historicas: int
     tabla: pd.DataFrame
     descartes: tuple[Descarte, ...]
+    columnas_predictoras: tuple[str, ...] = field(default=COLUMNAS_PREDICTORAS, kw_only=True)
 
     @property
     def descartes_por_variable(self) -> dict[str, int]:
         """Una fila puede carecer de varias variables; estos conteos se solapan."""
         conteos = Counter(nombre for d in self.descartes for nombre in d.faltantes)
-        return {nombre: conteos[nombre] for nombre in COLUMNAS_PREDICTORAS}
+        return {nombre: conteos[nombre] for nombre in self.columnas_predictoras}
+
+
+def _validar_columnas_predictoras(columnas: Sequence[str]) -> tuple[str, ...]:
+    """Solo los dos grupos canónicos ordenados; devuelve una tupla inmutable."""
+    if isinstance(columnas, (str, bytes)) or not isinstance(columnas, Sequence):
+        raise ValueError("columnas_predictoras debe ser una secuencia canónica ordenada.")
+    seleccion = tuple(columnas)
+    if (any(type(nombre) is not str for nombre in seleccion)
+            or seleccion not in (COLUMNAS_PREDICTORAS, COLUMNAS_PREDICTORAS_ALTERNATIVAS)):
+        raise ValueError("columnas_predictoras debe coincidir con el grupo clásico o alternativo.")
+    return seleccion
 
 
 def _validar_fecha(valor: date, nombre: str) -> None:
@@ -89,21 +103,27 @@ def _historico_serie(
     return preparar_observaciones(historico_hasta(serie, fecha_corte))
 
 
-def _variables_por_fecha(ventas: Mapping[date, float], objetivo: date) -> dict[str, float | int]:
+def _variables_por_fecha(
+    ventas: Mapping[date, float], objetivo: date,
+    *, columnas_predictoras: Sequence[str] = COLUMNAS_PREDICTORAS,
+) -> dict[str, float | int]:
     """Núcleo común: nunca consulta la venta del objetivo ni fechas posteriores."""
+    columnas = _validar_columnas_predictoras(columnas_predictoras)
     requeridas = {
         "lag_1": (objetivo - timedelta(days=1),),
         "lag_7": (objetivo - timedelta(days=7),),
         "lag_14": (objetivo - timedelta(days=14),),
         "media_7": tuple(objetivo - timedelta(days=d) for d in range(1, 8)),
     }
+    if columnas == COLUMNAS_PREDICTORAS_ALTERNATIVAS:
+        requeridas["media_14"] = tuple(objetivo - timedelta(days=d) for d in range(1, 15))
     faltantes = {nombre: tuple(d for d in fechas if d not in ventas)
                  for nombre, fechas in requeridas.items()}
     faltantes = {nombre: fechas for nombre, fechas in faltantes.items() if fechas}
     if faltantes:
         raise HistorialInsuficiente(objetivo, faltantes)
     # Dividir antes de sumar evita desbordar al sumar siete valores grandes.
-    return {
+    variables = {
         "lag_1": ventas[requeridas["lag_1"][0]],
         "lag_7": ventas[requeridas["lag_7"][0]],
         "lag_14": ventas[requeridas["lag_14"][0]],
@@ -111,17 +131,27 @@ def _variables_por_fecha(ventas: Mapping[date, float], objetivo: date) -> dict[s
         "dia_semana": objetivo.weekday(),
         "mes": objetivo.month,
     }
+    if columnas == COLUMNAS_PREDICTORAS_ALTERNATIVAS:
+        # Catorce días naturales previos exactos, sin imputar ni sumar primero.
+        media = fsum(ventas[d] / 14 for d in requeridas["media_14"])
+        if not isfinite(media):
+            raise ValueError("media_14 debe ser finita.")
+        variables["media_14"] = media
+    return variables
 
 
 def construir_tabla_serie(
     datos: pd.DataFrame, store_nbr: int, family: str, fecha_corte: date,
+    *, columnas_predictoras: Sequence[str] = COLUMNAS_PREDICTORAS,
 ) -> ResultadoSerie:
     """Construye X e y solo para objetivos reales observados hasta el corte.
 
-    X = resultado.tabla.loc[:, list(COLUMNAS_PREDICTORAS)]
+    Sin argumento conserva el grupo clásico; el alternativo añade media_14.
+    X = resultado.tabla.loc[:, list(resultado.columnas_predictoras)]
     y = resultado.tabla['sales']
     Las fechas sin respuesta real no se convierten en candidatos artificiales.
     """
+    columnas = _validar_columnas_predictoras(columnas_predictoras)
     historico = _historico_serie(datos, store_nbr, family, fecha_corte)
     if historico.empty:
         raise ValueError(f"Sin historial hasta {fecha_corte}: {store_nbr}/{family}.")
@@ -130,30 +160,36 @@ def construir_tabla_serie(
     descartes = []
     for objetivo, respuesta in ventas.items():
         try:
-            variables = _variables_por_fecha(ventas, objetivo)
+            variables = _variables_por_fecha(ventas, objetivo, columnas_predictoras=columnas)
         except HistorialInsuficiente as error:
             descartes.append(Descarte(objetivo, error.faltantes))
             continue
         registros.append({"store_nbr": store_nbr, "family": family,
                           "fecha_objetivo": objetivo, **variables, "sales": respuesta})
-    tabla = pd.DataFrame.from_records(registros, columns=COLUMNAS_TABLA)
-    return ResultadoSerie(store_nbr, family, fecha_corte, len(historico), tabla, tuple(descartes))
+    columnas_tabla = ("store_nbr", "family", "fecha_objetivo", *columnas, "sales")
+    tabla = pd.DataFrame.from_records(registros, columns=columnas_tabla)
+    return ResultadoSerie(store_nbr, family, fecha_corte, len(historico), tabla, tuple(descartes),
+                          columnas_predictoras=columnas)
 
 
 def construir_tablas(
     datos: pd.DataFrame, fecha_corte: date,
     claves: tuple[tuple[int, str], ...] | None = None,
+    *, columnas_predictoras: Sequence[str] = COLUMNAS_PREDICTORAS,
 ) -> tuple[ResultadoSerie, ...]:
     """Procesa por defecto las diez series aprobadas, manteniendo su orden."""
+    columnas = _validar_columnas_predictoras(columnas_predictoras)
     if claves is None:
         claves = leer_configuracion()
-    return tuple(construir_tabla_serie(datos, t, f, fecha_corte) for t, f in claves)
+    return tuple(construir_tabla_serie(datos, t, f, fecha_corte, columnas_predictoras=columnas)
+                 for t, f in claves)
 
 
 def construir_variables_futuras(
     datos: pd.DataFrame, store_nbr: int, family: str,
     fecha_corte: date, fecha_objetivo: date,
     predicciones_previas: Mapping[date, float] | None = None,
+    *, columnas_predictoras: Sequence[str] = COLUMNAS_PREDICTORAS,
 ) -> pd.DataFrame:
     """Devuelve una fila X en el mismo orden que entrenamiento.
 
@@ -162,6 +198,7 @@ def construir_variables_futuras(
     llamador ya tiene disponibles, con corte < fecha < objetivo. No se toman
     ventas reales de ese intervalo aunque estén presentes en datos.
     """
+    columnas = _validar_columnas_predictoras(columnas_predictoras)
     _validar_fecha(fecha_objetivo, "fecha_objetivo")
     _validar_fecha(fecha_corte, "fecha_corte")
     if fecha_objetivo <= fecha_corte:
@@ -180,8 +217,8 @@ def construir_variables_futuras(
             if isinstance(valor, bool) or not isfinite(numero) or numero < 0:
                 raise ValueError("La predicción previa debe ser finita y no negativa.")
             ventas[fecha] = numero
-    variables = _variables_por_fecha(ventas, fecha_objetivo)
-    return pd.DataFrame([variables], columns=COLUMNAS_PREDICTORAS)
+    variables = _variables_por_fecha(ventas, fecha_objetivo, columnas_predictoras=columnas)
+    return pd.DataFrame([variables], columns=columnas)
 
 
 def imprimir_informe(resultados: tuple[ResultadoSerie, ...]) -> None:
@@ -189,6 +226,8 @@ def imprimir_informe(resultados: tuple[ResultadoSerie, ...]) -> None:
     print("dia_semana: lunes=0, domingo=6; mes: 1 a 12. Respuesta: sales.")
     for r in resultados:
         print(f"\nTienda {r.store_nbr} | {r.family} | corte {r.fecha_corte}")
+        if r.columnas_predictoras != COLUMNAS_PREDICTORAS:
+            print("Variables de esta serie: " + ", ".join(r.columnas_predictoras))
         print(f"Históricas: {r.observaciones_historicas}; válidas: {len(r.tabla)}; "
               f"descartadas: {len(r.descartes)}.")
         print("Filas con cada variable ausente (conteos que pueden solaparse): "
