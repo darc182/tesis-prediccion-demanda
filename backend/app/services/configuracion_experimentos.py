@@ -1,4 +1,4 @@
-"""Contrato predictivo v1: funciones puras, sin estimadores, SQL ni entrenamiento.
+"""Contratos predictivos v1/v2: funciones puras, sin SQL ni entrenamiento.
 
 Los defaults completos son los efectivos de HU004 (comprobados por tests contra
 crear_estimador). No dependen de la versión de sklearn instalada al consultar.
@@ -17,6 +17,9 @@ VERSION_CONTRATO = 1
 VERSION_REGLAS = 1
 BASE = "estacional_semanal_recursiva"
 VARIABLES = ("lag_1", "lag_7", "lag_14", "media_7", "dia_semana", "mes")
+VERSION_CONTRATO_ALTERNATIVO = 2
+VERSION_REGLAS_ALTERNATIVO = 2
+VARIABLES_ALTERNATIVAS_V2 = (*VARIABLES, "media_14")
 
 _PARAMETROS = {
     BASE: {"periodo_estacional_dias": 7},
@@ -67,7 +70,7 @@ def _real(valor, minimo, maximo):
     return 0.0 if valor == 0 else float(valor)
 
 
-def _parametro(tecnica, nombre, valor, defecto):
+def _parametro(tecnica, nombre, valor, defecto, cantidad_variables):
     # Superficie acotada para F3; el resto se reconoce pero permanece fijo.
     if tecnica != BASE:
         if nombre == "random_state":
@@ -93,7 +96,7 @@ def _parametro(tecnica, nombre, valor, defecto):
                 if type(valor) is str and valor in ("sqrt", "log2"):
                     return valor
                 if type(valor) is int:
-                    return _entero(valor, 1, len(VARIABLES))
+                    return _entero(valor, 1, cantidad_variables)
             return _real(valor, 0.01, 1.0)
     # Comparación tipada: True no equivale a 1; 0.0 no equivale a False.
     if type(defecto) is float:
@@ -106,8 +109,10 @@ def _parametro(tecnica, nombre, valor, defecto):
 def normalizar_configuracion(solicitud: dict) -> dict:
     """Completa defaults explícitos del contrato; devuelve una copia normalizada.
 
-    Las seis variables son obligatorias en regresores; se admite permutarlas y
-    su orden distingue identidades. No admite onpromotion ni subconjuntos.
+    v1 conserva las seis variables y sus permutaciones históricas. v2 exige
+    ambas versiones explícitas y las siete variables en su orden canónico.
+    No infiere grupos ni admite onpromotion o subconjuntos. Validar v2 aquí
+    no lo habilita en F3, registro ni API, que conservan sus restricciones.
     max_features entero (número) y flotante (fracción) NO son intercambiables.
     """
     if type(solicitud) is not dict:
@@ -115,22 +120,36 @@ def normalizar_configuracion(solicitud: dict) -> dict:
     resultado = configuracion_predeterminada(solicitud.get("tecnica"))
     if set(solicitud) - set(resultado):
         raise ErrorConfiguracion("Campos de configuración desconocidos.")
+    contrato = solicitud.get("version_contrato", VERSION_CONTRATO)
+    reglas = solicitud.get("version_reglas", VERSION_REGLAS)
+    if type(contrato) is not int or type(reglas) is not int:
+        raise ErrorConfiguracion("Las versiones deben ser enteros reconocidos.")
+    if (contrato, reglas) == (VERSION_CONTRATO_ALTERNATIVO, VERSION_REGLAS_ALTERNATIVO):
+        if resultado["tecnica"] == BASE or "variables" not in solicitud:
+            raise ErrorConfiguracion("El grupo alternativo requiere un regresor y variables explícitas.")
+        resultado.update({"version_contrato": contrato, "version_reglas": reglas,
+                          "variables": list(VARIABLES_ALTERNATIVAS_V2)})
+    elif (contrato, reglas) != (VERSION_CONTRATO, VERSION_REGLAS):
+        raise ErrorConfiguracion("Combinación de versiones no soportada.")
     for nombre in ("version_contrato", "horizonte", "version_reglas"):
         valor = solicitud.get(nombre, resultado[nombre])
         if type(valor) is not int or valor != resultado[nombre]:
             raise ErrorConfiguracion(f"{nombre} no soportado.")
-    parametros = solicitud.get("parametros", {})
-    if type(parametros) is not dict or set(parametros) - set(resultado["parametros"]):
-        raise ErrorConfiguracion("Parámetros desconocidos o estructura inválida.")
-    for nombre, defecto in resultado["parametros"].items():
-        resultado["parametros"][nombre] = _parametro(
-            resultado["tecnica"], nombre, parametros.get(nombre, defecto), defecto)
     variables = solicitud.get("variables", resultado["variables"])
     if (type(variables) not in (list, tuple) or any(type(v) is not str for v in variables)
             or len(variables) != len(set(variables))
             or set(variables) != set(resultado["variables"])):
         raise ErrorConfiguracion("Variables requeridas ausentes, desconocidas o duplicadas.")
     resultado["variables"] = list(variables)
+    if contrato == VERSION_CONTRATO_ALTERNATIVO and tuple(variables) != VARIABLES_ALTERNATIVAS_V2:
+        raise ErrorConfiguracion("El grupo alternativo exige el orden canónico de sus siete variables.")
+    # La dimensión solo se valida después de resolver y validar el grupo.
+    parametros = solicitud.get("parametros", {})
+    if type(parametros) is not dict or set(parametros) - set(resultado["parametros"]):
+        raise ErrorConfiguracion("Parámetros desconocidos o estructura inválida.")
+    for nombre, defecto in resultado["parametros"].items():
+        resultado["parametros"][nombre] = _parametro(
+            resultado["tecnica"], nombre, parametros.get(nombre, defecto), defecto, len(variables))
     return resultado
 
 
@@ -169,6 +188,25 @@ def reglas_heredadas(tecnica: str, variables=None) -> dict:
                        "inferencia_incompleta": "error sin imputación",
                        "recursion": "incorporar solo estimaciones previas al objetivo",
                        "negativos": "comprobar finitud y aplicar max(0, predicción)", "hilos_numericos": 1})
+    return reglas
+
+
+def reglas_por_configuracion(solicitud: dict) -> dict:
+    """Resuelve reglas por contrato efectivo sin alterar el JSON histórico v1.
+
+    v2 extiende las reglas compartidas con media_14 de H2-A. Esta descripción
+    no construye variables, no entrena y no modifica registros almacenados.
+    """
+    config = normalizar_configuracion(solicitud)
+    reglas = reglas_heredadas(config["tecnica"], config["variables"])
+    if config["version_reglas"] == VERSION_REGLAS_ALTERNATIVO:
+        reglas.update({
+            "version_reglas": VERSION_REGLAS_ALTERNATIVO,
+            "media_14": "catorce observaciones de las catorce fechas naturales anteriores exactas",
+            "ventas_objetivo_predictor": False,
+            "calculo_medias": "math.fsum(venta / ventana); dividir antes de sumar, sin redondeo",
+            "media_14_finita": True,
+        })
     return reglas
 
 
@@ -211,7 +249,7 @@ def recuperar_configuracion(registro: dict) -> dict:
     config = normalizar_configuracion(solicitud)
     if (config["tecnica"] != tecnica
             or _json(config["parametros"]) != _json(normalizar_configuracion(
-                {"tecnica": tecnica, "parametros": parametros})["parametros"])
-            or _json(reglas) != _json(reglas_heredadas(tecnica, config["variables"]))):
+                {**config, "parametros": parametros})["parametros"])
+            or _json(reglas) != _json(reglas_por_configuracion(config))):
         raise ErrorConfiguracion("Reglas o parámetros no reconocibles de manera inequívoca.")
     return config
