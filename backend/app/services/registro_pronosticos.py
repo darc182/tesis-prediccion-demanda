@@ -127,34 +127,51 @@ def _leer_instantanea(conexion: sqlite3.Connection, serie_id: int, corte: date) 
     return _Instantanea(activo[0], activo[1], serie_id, serie[1], serie[2], filas)
 
 
+def _normalizar_configuracion(tecnica: str, solicitud: dict | None) -> dict:
+    """Resuelve el grupo ejecutable antes de abrir SQLite, sin entrenar."""
+    efectiva = configuracion.normalizar_configuracion(
+        {"tecnica": tecnica} if solicitud is None else solicitud)
+    if efectiva["tecnica"] != tecnica:
+        raise ValueError("La técnica de la configuración no coincide con la solicitada.")
+    if tecnica != linea_base.TECNICA:
+        # F2 reconoce permutaciones históricas v1; el motor no las ejecuta.
+        from scripts import modelos_prediccion as modelos
+        efectiva = modelos.normalizar_configuracion_entrenamiento(tecnica, efectiva)
+    return efectiva
+
+
 def _calcular(instantanea: _Instantanea, tecnica: str, corte: date,
               *, configuracion_solicitada: dict | None = None):
     """Adaptador a los scripts existentes: sin SQL ni lógica predictiva propia."""
+    efectiva = _normalizar_configuracion(tecnica, configuracion_solicitada)
     datos = pd.DataFrame(instantanea.filas, columns=["date", "sales", "onpromotion"])
     datos["store_nbr"] = instantanea.store_nbr
     datos["family"] = instantanea.family
     datos = preparar_observaciones(datos)
-    reglas = configuracion.reglas_heredadas(tecnica)
     versiones = {"python": platform.python_version(), "pandas": pd.__version__}
     if tecnica == linea_base.TECNICA:
         predicciones = linea_base.pronosticar_serie(
             datos, instantanea.store_nbr, instantanea.family, corte,
         )
         parametros = {"periodo_estacional_dias": 7}
+        columnas = []
         entrenamiento = {"observaciones_disponibles": len(datos)}
         auditoria = {"respaldos_directos": sum(p.uso_respaldo for p in predicciones)}
     else:
         # Importación diferida: la línea base no necesita cargar scikit-learn.
         from scripts import modelos_prediccion as modelos
-        efectiva = modelos.normalizar_configuracion_entrenamiento(tecnica, configuracion_solicitada)
         argumentos = {} if configuracion_solicitada is None else {"configuracion_solicitada": efectiva}
         modelo = modelos.entrenar_modelo(
             datos, instantanea.store_nbr, instantanea.family, tecnica, corte, **argumentos)
         modelos.comprobar_parametros_efectivos(modelo.estimador, efectiva)
+        columnas = list(modelo.columnas_predictoras)
+        if columnas != efectiva["variables"]:
+            raise ValueError("Las columnas del modelo no corresponden al contrato predictivo solicitado.")
+        if (modelo.store_nbr, modelo.family, modelo.tecnica, modelo.fecha_corte) != (
+                instantanea.store_nbr, instantanea.family, tecnica, corte):
+            raise ValueError("El modelo no corresponde a la serie, técnica y corte solicitados.")
         predicciones = modelos.pronosticar_recursivo(modelo, datos)
         parametros = modelo.estimador.get_params(deep=False)
-        if tuple(modelos.COLUMNAS_PREDICTORAS) != configuracion.VARIABLES:
-            raise ValueError("Las variables reales no corresponden al contrato predictivo.")
         versiones["scikit_learn"] = modelos.sklearn.__version__
         entrenamiento = {"filas_validas": modelo.filas_validas,
                           "filas_descartadas": modelo.filas_descartadas,
@@ -164,11 +181,11 @@ def _calcular(instantanea: _Instantanea, tecnica: str, corte: date,
     fin = datos["date"].max().date().isoformat()
     huella = hashlib.sha256(json.dumps(instantanea.filas, ensure_ascii=False,
                                       allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
-    predictiva = configuracion.normalizar_configuracion({"tecnica": tecnica, "parametros": parametros})
-    if configuracion.json_canonico(predictiva) != configuracion.json_canonico(
-            configuracion.normalizar_configuracion(
-                {"tecnica": tecnica} if configuracion_solicitada is None else configuracion_solicitada)):
-        raise ValueError("Los parámetros reales no corresponden a la configuración solicitada.")
+    predictiva = configuracion.normalizar_configuracion(
+        {**efectiva, "parametros": parametros, "variables": columnas})
+    if configuracion.identidad_configuracion(predictiva) != configuracion.identidad_configuracion(efectiva):
+        raise ValueError("La configuración ejecutada no corresponde a la solicitada.")
+    reglas = configuracion.reglas_por_configuracion(predictiva)
     config = {"version_registro": 2, "configuracion_predictiva": predictiva,
               "tecnica": tecnica, "parametros": parametros,
               "reglas": reglas, "versiones": versiones, "entrenamiento": entrenamiento,
@@ -286,18 +303,12 @@ def registrar_pronostico(
 
     Lanza ErrorRegistroPronostico con código y mensaje ante rechazo o fallo.
     configuracion_solicitada es un objeto F2 parcial o completo, solo por palabra
-    clave. None conserva HU004. La API HTTP actual no expone este argumento.
+    clave. None conserva HU004; los regresores admiten grupos canónicos 1/1 y 2/2.
     No se inicia ninguna operación por importar este módulo.
     """
     corte = _validar_solicitud(serie_id, tecnica, fecha_corte)
     try:
-        efectiva = configuracion.normalizar_configuracion(
-            {"tecnica": tecnica} if configuracion_solicitada is None else configuracion_solicitada)
-        if efectiva["tecnica"] != tecnica:
-            raise ValueError("La técnica de la configuración no coincide con la solicitada.")
-        variables = [] if tecnica == linea_base.TECNICA else list(configuracion.VARIABLES)
-        if efectiva["variables"] != variables:
-            raise ValueError("F3 requiere las variables originales en su orden original.")
+        efectiva = _normalizar_configuracion(tecnica, configuracion_solicitada)
     except (ValueError, TypeError) as error:
         raise ErrorRegistroPronostico("error_calculo", f"Configuración inválida: {error}") from error
     ruta = Path(ruta_base)

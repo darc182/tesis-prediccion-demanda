@@ -15,13 +15,42 @@ from unittest.mock import patch
 
 from backend.app.services import registro_pronosticos as registro
 from backend.app.services import configuracion_experimentos as configuracion
-from backend.app.services.consulta_pronosticos import consultar_pronostico, listar_pronosticos
+from backend.app.services.consulta_pronosticos import (
+    consultar_configuracion_pronostico, consultar_pronostico, listar_pronosticos,
+)
 from backend.app.storage.db import conectar, inicializar_base
 from scripts import modelos_prediccion as modelos
 
 
 CORTE = date(2017, 6, 16)
 BASE = "estacional_semanal_recursiva"
+
+
+def solicitud_v2(tecnica, **parametros):
+    return {"tecnica": tecnica, "version_contrato": 2, "version_reglas": 2,
+            "variables": list(configuracion.VARIABLES_ALTERNATIVAS_V2),
+            "parametros": {"random_state": 7, "min_samples_leaf": 2,
+                **({"n_estimators": 9, "max_features": 7} if tecnica == "random_forest"
+                   else {"max_iter": 12, "learning_rate": 0.1}), **parametros}}
+
+
+def solicitudes_v2_invalidas(tecnica):
+    solicitud = solicitud_v2(tecnica)
+    casos = [{**solicitud, "version_contrato": c, "version_reglas": r}
+             for c, r in ((2, 1), (1, 2), (3, 3), (True, 2), (2, 2.0))]
+    casos += [{k: deepcopy(v) for k, v in solicitud.items() if k != campo}
+              for campo in ("version_contrato", "version_reglas", "variables", "tecnica")]
+    casos += [{**solicitud, "variables": list(v)} for v in (
+        configuracion.VARIABLES, tuple(reversed(configuracion.VARIABLES_ALTERNATIVAS_V2)),
+        (*configuracion.VARIABLES_ALTERNATIVAS_V2, "lag_1"),
+        (*configuracion.VARIABLES, "onpromotion"))]
+    casos += [{**solicitud, "grupo": "desconocido"}, {**solicitud, "horizonte": 14},
+              {**solicitud, "tecnica": BASE},
+              {**solicitud, "tecnica": next(t for t in modelos.TECNICAS if t != tecnica)},
+              {**solicitud, "parametros": {"random_state": True}},
+              {**solicitud, "parametros": {"max_features": 8}},
+              {**solicitud, "parametros": {"warm_start": True}}]
+    return casos
 
 
 class RegistroPronosticosTests(unittest.TestCase):
@@ -897,6 +926,293 @@ class RegistroPronosticosTests(unittest.TestCase):
         self.consultar("DELETE FROM venta_diaria WHERE serie_id=83 AND fecha<=?", (CORTE.isoformat(),))
         with self.assertRaisesRegex(registro.ErrorRegistroPronostico, "no hay historial"):
             self.registrar()
+
+
+    def comprobar_registro_v2_real(self, tecnica):
+        solicitud = solicitud_v2(tecnica)
+        copia = deepcopy(solicitud)
+        entrenar = modelos.entrenar_modelo
+        entrenados = []
+        def observar(*args, **kwargs):
+            m = entrenar(*args, **kwargs)
+            entrenados.append(m)
+            return m
+        historicos = self.historicos()
+        with patch.object(modelos, "entrenar_modelo", side_effect=observar):
+            r = self.registrar(tecnica, configuracion_solicitada=solicitud)
+        self.assertTrue(r.nuevo)
+        self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
+        self.assertEqual(len(entrenados), 1)
+        m = entrenados[0]
+        columnas = configuracion.VARIABLES_ALTERNATIVAS_V2
+        self.assertEqual(m.columnas_predictoras, columnas)
+        self.assertEqual(tuple(m.estimador.feature_names_in_), columnas)
+        self.assertEqual(m.estimador.n_features_in_, 7)
+        self.assertEqual((m.filas_validas, m.filas_descartadas), (46, 14))
+        texto = self.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (r.experimento_id,))[0][0]
+        guardada = json.loads(texto)
+        efectiva = configuracion.normalizar_configuracion(solicitud)
+        self.assertEqual(guardada["version_registro"], 2)
+        self.assertEqual(guardada["configuracion_predictiva"], efectiva)
+        self.assertEqual(guardada["reglas"], configuracion.reglas_por_configuracion(efectiva))
+        self.assertEqual(json.dumps(guardada["parametros"], sort_keys=True),
+                         json.dumps(m.estimador.get_params(deep=False), sort_keys=True))
+        self.assertEqual(registro._contenido_config(guardada), configuracion.identidad_configuracion(solicitud))
+        lectura = consultar_configuracion_pronostico(self.ruta, r.pronostico_id)
+        self.assertEqual(lectura["configuracion"], efectiva)
+        self.assertFalse(lectura["es_predeterminada"])
+        detalles = consultar_pronostico(self.ruta, r.pronostico_id)["detalles"]
+        self.assertEqual([d["paso"] for d in detalles], list(range(1, 16)))
+        self.assertEqual([d["fecha_objetivo"] for d in detalles],
+                         [(CORTE + timedelta(days=i)).isoformat() for i in range(1, 16)])
+        datos = pd.DataFrame(self.filas, columns=["date", "sales", "onpromotion"])
+        datos["store_nbr"], datos["family"] = 17, "PREPARED FOODS"
+        self.assertEqual([d["venta_estimada"] for d in detalles],
+                         [p.venta_estimada for p in modelos.pronosticar_recursivo(m, datos)])
+        self.assertEqual(solicitud, copia)
+        self.assertEqual(self.historicos(), historicos)
+        self.assertEqual(self.consultar("PRAGMA foreign_key_check"), [])
+
+    def test_registro_rf_v2_real_con_parametros_columnas_reglas_y_quince_detalles(self):
+        self.comprobar_registro_v2_real("random_forest")
+
+    def test_registro_hgb_v2_real_con_parametros_columnas_reglas_y_quince_detalles(self):
+        self.comprobar_registro_v2_real("hist_gradient_boosting")
+
+    def test_v2_coexiste_con_v1_antiguo_y_otra_semilla_y_reutiliza_sin_dml(self):
+        casos = []
+        originales = {}
+        for tecnica in modelos.TECNICAS:
+            v2 = solicitud_v2(tecnica, max_features=1.0)
+            v1 = {"tecnica": tecnica, "parametros": deepcopy(v2["parametros"])}
+            antiguo = self.registrar(tecnica, configuracion_solicitada=v1)
+            self.convertir_a_formato_antiguo(antiguo.experimento_id)
+            originales[antiguo.experimento_id] = self.consultar(
+                "SELECT configuracion_json FROM experimento WHERE id=?", (antiguo.experimento_id,))[0][0]
+            casos.append((tecnica, v1, antiguo))
+            for solicitud in (v2, solicitud_v2(tecnica, max_features=1.0, random_state=19)):
+                casos.append((tecnica, solicitud, self.registrar(tecnica, configuracion_solicitada=solicitud)))
+            self.assertNotEqual(configuracion.identidad_configuracion(v1), configuracion.identidad_configuracion(v2))
+        self.assertEqual(len({r.experimento_id for _, _, r in casos}), 6)
+        self.assertEqual(self.conteos(), (6, 6, 90, 0, 0))
+        contenido = self.ruta.read_bytes()
+        sql = []
+        abrir = registro._abrir_base
+        def observar(*args, **kwargs):
+            c = abrir(*args, **kwargs)
+            self.assertEqual(c.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            c.set_trace_callback(sql.append)
+            return c
+        with patch.object(registro, "_abrir_base", side_effect=observar):
+            for tecnica, solicitud, anterior in reversed(casos):
+                r = self.registrar(tecnica, configuracion_solicitada=solicitud)
+                self.assertTrue(r.reutilizado)
+                self.assertEqual((r.experimento_id, r.pronostico_id), (anterior.experimento_id, anterior.pronostico_id))
+        self.assertFalse(any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) for s in sql))
+        self.assertIn("BEGIN IMMEDIATE", sql)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        for eid, texto in originales.items():
+            self.assertEqual(self.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (eid,))[0][0], texto)
+        self.assertEqual(self.consultar("PRAGMA foreign_key_check"), [])
+
+    def test_v2_invalido_rechazado_antes_de_abrir_sqlite_o_entrenar(self):
+        contenido = self.ruta.read_bytes()
+        with patch.object(registro, "_abrir_base") as abrir, \
+                patch.object(modelos, "entrenar_modelo") as entrenar, patch.object(registro, "_calcular") as calcular:
+            for tecnica in modelos.TECNICAS:
+                for solicitud in solicitudes_v2_invalidas(tecnica):
+                    copia = deepcopy(solicitud)
+                    with self.subTest(tecnica=tecnica, solicitud=solicitud), self.assertRaises(registro.ErrorRegistroPronostico) as error:
+                        self.registrar(tecnica, configuracion_solicitada=solicitud)
+                    self.assertEqual(error.exception.codigo, "error_calculo")
+                    self.assertEqual(solicitud, copia)
+            abrir.assert_not_called()
+            entrenar.assert_not_called()
+            calcular.assert_not_called()
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (0, 0, 0, 0, 0))
+
+    def test_v2_modelo_incoherente_no_abre_escritura(self):
+        datos = pd.DataFrame(self.filas, columns=["date", "sales", "onpromotion"])
+        datos["store_nbr"], datos["family"] = 17, "PREPARED FOODS"
+        abrir = registro._abrir_base
+        for tecnica in modelos.TECNICAS:
+            solicitud = solicitud_v2(tecnica)
+            m = modelos.entrenar_modelo(datos, 17, "PREPARED FOODS", tecnica, CORTE,
+                                       configuracion_solicitada=solicitud)
+            casos = [replace(m, columnas_predictoras=configuracion.VARIABLES),
+                     replace(m, store_nbr=99), replace(m, family="OTRA"),
+                     replace(m, tecnica=BASE), replace(m, fecha_corte=date(2017, 7, 1))]
+            for atributo, valor in (("n_features_in_", 6), ("feature_names_in_", list(reversed(m.columnas_predictoras))),
+                                    ("random_state", 99)):
+                corrupto = deepcopy(m)
+                setattr(corrupto.estimador, atributo, valor)
+                casos.append(corrupto)
+            for corrupto in casos:
+                contenido = self.ruta.read_bytes()
+                with patch.object(modelos, "entrenar_modelo", return_value=corrupto), \
+                        patch.object(registro, "_abrir_base", wraps=abrir) as aperturas:
+                    with self.assertRaises(registro.ErrorRegistroPronostico) as error:
+                        self.registrar(tecnica, configuracion_solicitada=solicitud)
+                    self.assertEqual(error.exception.codigo, "error_calculo")
+                self.assertEqual(len(aperturas.call_args_list), 1)
+                self.assertEqual(aperturas.call_args.kwargs, {})
+                self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (0, 0, 0, 0, 0))
+
+    def test_v2_contradicciones_en_resultado_y_reglas_rechazadas_antes_de_escritura(self):
+        with closing(conectar(self.ruta)) as c:
+            instantanea = registro._leer_instantanea(c, 83, CORTE)
+        abrir = registro._abrir_base
+        for tecnica in modelos.TECNICAS:
+            solicitud = solicitud_v2(tecnica)
+            p, config, inicio, fin = registro._calcular(instantanea, tecnica, CORTE, configuracion_solicitada=solicitud)
+            casos = []
+            for bloque, campo, valor in (("reglas", "media_14", "regla falsa"),
+                                         ("configuracion_predictiva", "version_reglas", 1),
+                                         ("configuracion_predictiva", "variables", list(configuracion.VARIABLES)),
+                                         ("parametros", "random_state", 99)):
+                corrupta = deepcopy(config)
+                corrupta[bloque][campo] = valor
+                casos.append((corrupta, "error_calculo"))
+            distinta = deepcopy(config)
+            distinta["parametros"]["random_state"] = 99
+            distinta["configuracion_predictiva"]["parametros"]["random_state"] = 99
+            casos.append((distinta, "resultado_invalido"))
+            for corrupta, codigo in casos:
+                contenido = self.ruta.read_bytes()
+                with patch.object(registro, "_calcular", return_value=(p, corrupta, inicio, fin)), \
+                        patch.object(registro, "_abrir_base", wraps=abrir) as aperturas:
+                    with self.assertRaises(registro.ErrorRegistroPronostico) as error:
+                        self.registrar(tecnica, configuracion_solicitada=solicitud)
+                    self.assertEqual(error.exception.codigo, codigo)
+                self.assertEqual(len(aperturas.call_args_list), 1)
+                self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (0, 0, 0, 0, 0))
+
+    def test_v2_rollback_completo_preserva_experimento_previo(self):
+        previo = self.registrar()
+        consulta = consultar_pronostico(self.ruta, previo.pronostico_id)
+        historicos = self.historicos()
+        for tecnica in modelos.TECNICAS:
+            for tabla, condicion, accion in (("pronostico", "", "ABORT,'fallo cabecera v2'"),
+                                              ("detalle_pronostico", "WHEN NEW.paso=8", "ABORT,'fallo detalle v2'"),
+                                              ("detalle_pronostico", "WHEN NEW.paso=8", "IGNORE")):
+                self.consultar(f"CREATE TRIGGER fallo_v2 BEFORE INSERT ON {tabla} {condicion} "
+                               f"BEGIN SELECT RAISE({accion}); END")
+                contenido = self.ruta.read_bytes()
+                try:
+                    with self.subTest(tecnica=tecnica, accion=accion), self.assertRaises(registro.ErrorRegistroPronostico) as error:
+                        self.registrar(tecnica, configuracion_solicitada=solicitud_v2(tecnica))
+                    self.assertEqual(error.exception.codigo, "error_persistencia")
+                    self.assertEqual(self.ruta.read_bytes(), contenido)
+                    self.assertEqual(self.conteos(), (1, 1, 15, 0, 0))
+                    self.assertEqual(consultar_pronostico(self.ruta, previo.pronostico_id), consulta)
+                    self.assertEqual(self.historicos(), historicos)
+                    self.assertEqual(self.consultar("PRAGMA foreign_key_check"), [])
+                finally:
+                    self.consultar("DROP TRIGGER fallo_v2")
+
+    def test_v2_conflictos_por_detalles_incompletos_valores_o_reglas_corruptas(self):
+        for tecnica in modelos.TECNICAS:
+            solicitud = solicitud_v2(tecnica)
+            r = self.registrar(tecnica, configuracion_solicitada=solicitud)
+            detalle = self.consultar("SELECT paso,fecha_objetivo,venta_estimada FROM detalle_pronostico "
+                                    "WHERE pronostico_id=? AND paso=15", (r.pronostico_id,))[0]
+            texto = self.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (r.experimento_id,))[0][0]
+            for cambio in ("valor", "incompleto", "reglas"):
+                if cambio == "valor":
+                    self.consultar("UPDATE detalle_pronostico SET venta_estimada=99 WHERE pronostico_id=? AND paso=15", (r.pronostico_id,))
+                elif cambio == "incompleto":
+                    self.consultar("DELETE FROM detalle_pronostico WHERE pronostico_id=? AND paso=15", (r.pronostico_id,))
+                else:
+                    corrupta = json.loads(texto)
+                    corrupta["reglas"] = configuracion.reglas_heredadas(tecnica)
+                    self.consultar("UPDATE experimento SET configuracion_json=? WHERE id=?", (json.dumps(corrupta), r.experimento_id))
+                contenido = self.ruta.read_bytes()
+                with self.subTest(tecnica=tecnica, cambio=cambio), self.assertRaises(registro.ErrorRegistroPronostico) as error:
+                    self.registrar(tecnica, configuracion_solicitada=solicitud)
+                self.assertEqual(error.exception.codigo, "conflicto")
+                self.assertEqual(self.ruta.read_bytes(), contenido)
+                self.consultar("DELETE FROM detalle_pronostico WHERE pronostico_id=? AND paso=15", (r.pronostico_id,))
+                self.consultar("INSERT INTO detalle_pronostico (pronostico_id,paso,fecha_objetivo,venta_estimada) VALUES (?,?,?,?)", (r.pronostico_id, *detalle))
+                self.consultar("UPDATE experimento SET configuracion_json=? WHERE id=?", (texto, r.experimento_id))
+
+    def test_v2_solo_historial_hasta_corte_con_ausencias_ceros_y_fracciones(self):
+        self.consultar("DELETE FROM venta_diaria WHERE serie_id=83 AND fecha=?", ((CORTE - timedelta(days=30)).isoformat(),))
+        entrenar = modelos.entrenar_modelo
+        abrir = registro._abrir_base
+        for tecnica in modelos.TECNICAS:
+            solicitud = solicitud_v2(tecnica)
+            with closing(conectar(self.ruta)) as c:
+                instantanea = registro._leer_instantanea(c, 83, CORTE)
+            anteriores = registro._calcular(instantanea, tecnica, CORTE, configuracion_solicitada=solicitud)[0]
+            self.consultar("UPDATE venta_diaria SET sales='NO_LEER_FUTURO' WHERE serie_id=83 AND fecha>?", (CORTE.isoformat(),))
+            eventos = []
+            def observar(datos, tienda, familia, t, corte, **kwargs):
+                eventos.append("fit")
+                self.assertEqual(len(datos), 59)
+                self.assertTrue(datos["date"].le(pd.Timestamp(corte)).all())
+                self.assertTrue((datos["sales"] == 0).any())
+                self.assertTrue((datos["sales"] % 1 != 0).any())
+                with closing(conectar(self.ruta)) as c:
+                    c.execute("BEGIN IMMEDIATE")
+                    c.rollback()
+                m = entrenar(datos, tienda, familia, t, corte, **kwargs)
+                self.assertEqual(m.filas_validas + m.filas_descartadas, 59)
+                self.assertEqual(m.filas_validas, 31)
+                return m
+            def abrir_observado(*args, **kwargs):
+                if kwargs.get("escritura"):
+                    eventos.append("escritura")
+                return abrir(*args, **kwargs)
+            with patch.object(modelos, "entrenar_modelo", side_effect=observar), \
+                    patch.object(registro, "_abrir_base", side_effect=abrir_observado):
+                r = self.registrar(tecnica, configuracion_solicitada=solicitud)
+            self.assertEqual(eventos, ["fit", "escritura"])
+            consulta = consultar_pronostico(self.ruta, r.pronostico_id)
+            self.assertEqual([d["venta_estimada"] for d in consulta["detalles"]], [p.venta_estimada for p in anteriores])
+            config = json.loads(self.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (r.experimento_id,))[0][0])
+            self.assertEqual(config["historial"]["cantidad"], 59)
+
+    def test_v2_historial_insuficiente_para_media_14_no_registra(self):
+        self.consultar("DELETE FROM venta_diaria WHERE serie_id=83 AND fecha=?", ((CORTE - timedelta(days=9)).isoformat(),))
+        contenido = self.ruta.read_bytes()
+        for tecnica in modelos.TECNICAS:
+            with self.subTest(tecnica=tecnica), self.assertRaisesRegex(registro.ErrorRegistroPronostico, "media_14") as error:
+                self.registrar(tecnica, configuracion_solicitada=solicitud_v2(tecnica))
+            self.assertEqual(error.exception.codigo, "error_calculo")
+            self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.conteos(), (0, 0, 0, 0, 0))
+
+    def test_v2_recomprueba_historico_despues_del_calculo_real(self):
+        calcular = registro._calcular
+        for tecnica in modelos.TECNICAS:
+            def alterar(*args, **kwargs):
+                resultado = calcular(*args, **kwargs)
+                self.consultar("UPDATE venta_diaria SET sales=sales+1 WHERE serie_id=83 AND fecha=?", (self.filas[0][0],))
+                return resultado
+            with patch.object(registro, "_calcular", side_effect=alterar), self.assertRaises(registro.ErrorRegistroPronostico) as error:
+                self.registrar(tecnica, configuracion_solicitada=solicitud_v2(tecnica))
+            self.assertEqual(error.exception.codigo, "historial_cambiado")
+            self.assertEqual(self.conteos(), (0, 0, 0, 0, 0))
+
+    def test_v2_concurrencia_real_reutiliza_y_conserva_v1(self):
+        for i, tecnica in enumerate(modelos.TECNICAS, 1):
+            self.registrar(tecnica)
+            barrera = Barrier(2)
+            calcular = registro._calcular
+            def sincronizar(*args, **kwargs):
+                resultado = calcular(*args, **kwargs)
+                barrera.wait(timeout=20)
+                return resultado
+            with patch.object(registro, "_calcular", side_effect=sincronizar), ThreadPoolExecutor(max_workers=2) as ejecutor:
+                futuros = [ejecutor.submit(self.registrar, tecnica, configuracion_solicitada=solicitud_v2(tecnica)) for _ in range(2)]
+                resultados = [f.result(timeout=30) for f in futuros]
+            self.assertEqual(sorted(r.nuevo for r in resultados), [False, True])
+            self.assertEqual(len({(r.experimento_id, r.pronostico_id) for r in resultados}), 1)
+            self.assertEqual(self.conteos(), (2*i, 2*i, 30*i, 0, 0))
+            self.assertEqual(self.consultar("PRAGMA foreign_key_check"), [])
 
 
 if __name__ == "__main__":

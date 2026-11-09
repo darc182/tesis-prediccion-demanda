@@ -193,35 +193,70 @@ class ApiPronosticosTests(unittest.TestCase):
         self.assertEqual(self.ruta.read_bytes(), contenido)
         self.assertEqual(self.datos.conteos(), (0, 0, 0, 0, 0))
 
-    def comprobar_barrera_temporal_v2(self, tecnica):
-        solicitud = {"tecnica": tecnica, "version_contrato": 2, "version_reglas": 2,
-                     "variables": list(configuraciones.VARIABLES_ALTERNATIVAS_V2)}
-        # El contrato y el motor sí reconocen 2/2; solo el POST lo bloquea.
-        self.assertEqual(fixtures.modelos.normalizar_configuracion_entrenamiento(tecnica, solicitud),
-                         configuraciones.normalizar_configuracion(solicitud))
+    def comprobar_post_v2_real(self, tecnica):
+        original = self.crear(tecnica)
+        self.datos.convertir_a_formato_antiguo(original["experimento_id"])
+        texto_original = self.datos.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (original["experimento_id"],))[0][0]
+        anterior = self.cliente.get(f"{PREFIJO}/{original['pronostico_id']}").json()
+        solicitud = fixtures.solicitud_v2(tecnica)
+        copia = deepcopy(solicitud)
+        modelos = []
+        entrenar = fixtures.modelos.entrenar_modelo
+        def observar(*args, **kwargs):
+            modelo = entrenar(*args, **kwargs)
+            modelos.append(modelo)
+            return modelo
+        with patch.object(api, "registrar_pronostico", wraps=registro.registrar_pronostico) as registrar, \
+                patch.object(fixtures.modelos, "entrenar_modelo", side_effect=observar):
+            nuevo = self.crear(tecnica, configuracion=solicitud)
+        efectiva = configuraciones.normalizar_configuracion(solicitud)
+        registrar.assert_called_once_with(self.ruta, 83, tecnica, "2017-06-16", configuracion_solicitada=efectiva)
+        self.assertEqual(len(modelos), 1)
+        m = modelos[0]
+        self.assertEqual(m.columnas_predictoras, configuraciones.VARIABLES_ALTERNATIVAS_V2)
+        self.assertEqual(tuple(m.estimador.feature_names_in_), m.columnas_predictoras)
+        self.assertEqual(m.estimador.n_features_in_, 7)
+        guardada = json.loads(self.datos.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (nuevo["experimento_id"],))[0][0])
+        self.assertEqual(guardada["configuracion_predictiva"], efectiva)
+        self.assertEqual(guardada["reglas"], configuraciones.reglas_por_configuracion(efectiva))
+        self.assertEqual(json.dumps(guardada["parametros"], sort_keys=True), json.dumps(m.estimador.get_params(deep=False), sort_keys=True))
+        self.comprobar_configuracion_publica(self.obtener_configuracion(nuevo["pronostico_id"]), nuevo, efectiva, False)
+        self.assertNotEqual(configuraciones.identidad_configuracion(efectiva), configuraciones.identidad_configuracion({"tecnica": tecnica}))
+        detalles = self.cliente.get(f"{PREFIJO}/{nuevo['pronostico_id']}").json()["detalles"]
+        self.assertEqual(len(detalles), 15)
+        self.assertEqual([d["paso"] for d in detalles], list(range(1, 16)))
+        self.assertEqual([d["fecha_objetivo"] for d in detalles],
+                         [(date(2017, 6, 16) + timedelta(days=i)).isoformat() for i in range(1, 16)])
+        otra = fixtures.solicitud_v2(tecnica, random_state=19)
+        tercero = self.crear(tecnica, configuracion=otra)
+        self.assertEqual(len({r["experimento_id"] for r in (original, nuevo, tercero)}), 3)
         contenido = self.ruta.read_bytes()
-        historicos = self.datos.historicos()
-        with patch.object(api, "registrar_pronostico") as registrar, \
-                patch.object(fixtures.modelos, "entrenar_modelo") as entrenar, \
-                patch.object(fixtures.modelos, "normalizar_configuracion_entrenamiento") as motor, \
-                patch.object(registro, "_abrir_base") as abrir:
-            r = self.post(tecnica, configuracion=solicitud)
-            self.assertEqual(r.status_code, 422, r.text)
-            self.assertEqual(r.json(), {"detail": {"codigo": "configuracion_invalida",
-                                                   "mensaje": api.ERRORES["configuracion_invalida"][1]}})
-            registrar.assert_not_called()
-            entrenar.assert_not_called()
-            motor.assert_not_called()
-            abrir.assert_not_called()
+        sql = []
+        abrir = registro._abrir_base
+        def abrir_observado(*args, **kwargs):
+            c = abrir(*args, **kwargs)
+            c.set_trace_callback(sql.append)
+            return c
+        with patch.object(registro, "_abrir_base", side_effect=abrir_observado):
+            for config, previo in ((OMITIDA, original), (solicitud, nuevo), (otra, tercero)):
+                r = self.post(tecnica, configuracion=config)
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertEqual(r.json(), {**previo, "nuevo": False, "reutilizado": True})
+        self.assertFalse(any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) for s in sql))
         self.assertEqual(self.ruta.read_bytes(), contenido)
-        self.assertEqual(self.datos.historicos(), historicos)
-        self.assertEqual(self.datos.conteos(), (0, 0, 0, 0, 0))
+        self.assertEqual(self.datos.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (original["experimento_id"],))[0][0], texto_original)
+        self.assertEqual(self.cliente.get(f"{PREFIJO}/{original['pronostico_id']}").json(), anterior)
+        lista = self.cliente.get(f"{PREFIJO}/series/83").json()["pronosticos"]
+        self.assertEqual({p["id"] for p in lista}, {r["pronostico_id"] for r in (original, nuevo, tercero)})
+        self.assertEqual(self.datos.conteos(), (3, 3, 45, 0, 0))
+        self.assertEqual(self.datos.consultar("PRAGMA foreign_key_check"), [])
+        self.assertEqual(solicitud, copia)
 
-    def test_post_rf_v2_bloqueado_temporalmente_sin_motor_registro_ni_escrituras(self):
-        self.comprobar_barrera_temporal_v2("random_forest")
+    def test_post_rf_v2_real_crea_consulta_y_reutiliza_con_v1_antiguo(self):
+        self.comprobar_post_v2_real("random_forest")
 
-    def test_post_hgb_v2_bloqueado_temporalmente_sin_motor_registro_ni_escrituras(self):
-        self.comprobar_barrera_temporal_v2("hist_gradient_boosting")
+    def test_post_hgb_v2_real_crea_consulta_y_reutiliza_con_v1_antiguo(self):
+        self.comprobar_post_v2_real("hist_gradient_boosting")
 
     def test_hgb_y_linea_base_rechazan_cambios_fijos_y_rangos_de_f2(self):
         casos = [("hist_gradient_boosting", {"early_stopping": True}),
@@ -966,6 +1001,117 @@ class ApiPronosticosTests(unittest.TestCase):
         with patch.dict(os.environ, {"TESIS_DB_PATH": str(self.ruta)}):
             app.dependency_overrides[obtener_ruta_base] = lambda: obtener_ruta_base()
             self.assertEqual(self.cliente.get(f"{PREFIJO}/series/83").status_code, 200)
+
+
+    def test_v2_malformado_es_422_antes_de_registro_entrenamiento_y_sqlite(self):
+        contenido = self.ruta.read_bytes()
+        with patch.object(api, "registrar_pronostico") as registrar, \
+                patch.object(fixtures.modelos, "entrenar_modelo") as entrenar, \
+                patch.object(registro, "_abrir_base") as abrir:
+            for tecnica in fixtures.modelos.TECNICAS:
+                casos = fixtures.solicitudes_v2_invalidas(tecnica)
+                otra_tecnica = next(t for t in fixtures.modelos.TECNICAS if t != tecnica)
+                casos.append({**fixtures.solicitud_v2(otra_tecnica), "parametros": {}})
+                for solicitud in casos:
+                    with self.subTest(tecnica=tecnica, solicitud=solicitud):
+                        r = self.post(tecnica, configuracion=solicitud)
+                        self.assertEqual(r.status_code, 422, r.text)
+                        self.assertEqual(r.json(), {"detail": {"codigo": "configuracion_invalida",
+                                                             "mensaje": api.ERRORES["configuracion_invalida"][1]}})
+            registrar.assert_not_called()
+            entrenar.assert_not_called()
+            abrir.assert_not_called()
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.datos.conteos(), (0, 0, 0, 0, 0))
+
+    def test_gets_v2_solo_lectura_sin_modelos_ni_escrituras(self):
+        casos = [(t, self.crear(t, configuracion=fixtures.solicitud_v2(t))) for t in fixtures.modelos.TECNICAS]
+        contenido, historicos = self.ruta.read_bytes(), self.datos.historicos()
+        conectar_original = sqlite3.connect
+        sql, aperturas = [], []
+        def observar(database, **kwargs):
+            aperturas.append((database, kwargs))
+            c = conectar_original(database, **kwargs)
+            c.set_trace_callback(sql.append)
+            return c
+        with patch.object(api, "registrar_pronostico") as registrar, patch.object(registro, "_calcular") as calcular, \
+                patch.object(fixtures.modelos, "entrenar_modelo") as entrenar, \
+                patch.object(fixtures.modelos, "crear_estimador") as crear, \
+                patch.object(fixtures.modelos, "pronosticar_recursivo") as predecir, \
+                patch.object(consulta.sqlite3, "connect", side_effect=observar):
+            for tecnica, r in casos:
+                efectiva = configuraciones.normalizar_configuracion(fixtures.solicitud_v2(tecnica))
+                self.comprobar_configuracion_publica(self.obtener_configuracion(r["pronostico_id"]), r, efectiva, False)
+                self.assertEqual(self.cliente.get(f"{PREFIJO}/{r['pronostico_id']}").status_code, 200)
+                self.assertEqual(self.cliente.get(f"{PREFIJO}/series/83").status_code, 200)
+            for llamada in (registrar, calcular, entrenar, crear, predecir):
+                llamada.assert_not_called()
+        self.assertEqual(len(aperturas), 6)
+        self.assertTrue(all(uri.endswith("?mode=ro") and opciones["uri"] for uri, opciones in aperturas))
+        self.assertFalse(any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) for s in sql))
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.datos.historicos(), historicos)
+
+    def test_v2_configuracion_corrupta_get_409_y_post_conflicto_sin_sobrescritura(self):
+        for tecnica in fixtures.modelos.TECNICAS:
+            solicitud = fixtures.solicitud_v2(tecnica)
+            r = self.crear(tecnica, configuracion=solicitud)
+            texto = self.datos.consultar("SELECT configuracion_json FROM experimento WHERE id=?", (r["experimento_id"],))[0][0]
+            original = json.loads(texto)
+            casos = []
+            for bloque, campo, valor in (("reglas", "media_14", "PRIVADO SELECT regla contradictoria"),
+                                         ("configuracion_predictiva", "version_reglas", 1),
+                                         ("configuracion_predictiva", "variables", list(reversed(configuraciones.VARIABLES_ALTERNATIVAS_V2))),
+                                         ("parametros", "random_state", 123)):
+                corrupta = deepcopy(original)
+                corrupta[bloque][campo] = valor
+                casos.append(corrupta)
+            for corrupta in casos:
+                self.guardar_json_de_prueba(r["experimento_id"], json.dumps(corrupta))
+                contenido = self.ruta.read_bytes()
+                lectura = self.obtener_configuracion(r["pronostico_id"])
+                self.assertEqual(lectura.status_code, 409, lectura.text)
+                self.assertEqual(lectura.json()["detail"]["codigo"], "pronostico_corrupto")
+                respuesta = self.post(tecnica, configuracion=solicitud)
+                self.assertEqual(respuesta.status_code, 409, respuesta.text)
+                self.assertEqual(respuesta.json()["detail"]["codigo"], "conflicto")
+                self.assertNotIn("PRIVADO", lectura.text + respuesta.text)
+                self.assertEqual(self.ruta.read_bytes(), contenido)
+            self.guardar_json_de_prueba(r["experimento_id"], texto)
+            self.assertEqual(self.post(tecnica, configuracion=solicitud).status_code, 200)
+
+    def test_v2_fallo_persistencia_http_503_con_rollback_y_experimento_previo_intacto(self):
+        previo = self.crear()
+        consulta_previa = self.cliente.get(f"{PREFIJO}/{previo['pronostico_id']}").json()
+        self.datos.consultar("CREATE TRIGGER fallo_v2 BEFORE INSERT ON detalle_pronostico WHEN NEW.paso=8 "
+                             "BEGIN SELECT RAISE(ABORT,'PRIVADO fallo SQL v2'); END")
+        contenido, historicos = self.ruta.read_bytes(), self.datos.historicos()
+        for tecnica in fixtures.modelos.TECNICAS:
+            respuesta = self.post(tecnica, configuracion=fixtures.solicitud_v2(tecnica))
+            self.assertEqual(respuesta.status_code, 503, respuesta.text)
+            self.assertEqual(respuesta.json(), {"detail": {"codigo": "error_persistencia",
+                                                         "mensaje": api.ERRORES["error_persistencia"][1]}})
+            self.assertNotIn("PRIVADO", respuesta.text)
+            self.assertEqual(self.ruta.read_bytes(), contenido)
+            self.assertEqual(self.datos.conteos(), (1, 1, 15, 0, 0))
+            self.assertEqual(self.cliente.get(f"{PREFIJO}/{previo['pronostico_id']}").json(), consulta_previa)
+            self.assertEqual(self.datos.historicos(), historicos)
+            self.assertEqual(self.datos.consultar("PRAGMA foreign_key_check"), [])
+
+    def test_v2_valido_conserva_errores_publicos_de_corte_serie_e_historial(self):
+        contenido = self.ruta.read_bytes()
+        for tecnica in fixtures.modelos.TECNICAS:
+            for corte, serie, codigo, estado in (("2017-06-15", 83, "corte_no_autorizado", 422),
+                                                 ("2017-07-31", 83, "prueba_reservada", 422),
+                                                 ("2017-06-16", 999, "serie_inexistente", 404),
+                                                 ("2017-06-16", 24, "serie_inactiva", 404),
+                                                 ("2017-06-16", 84, "error_calculo", 422)):
+                with self.subTest(tecnica=tecnica, codigo=codigo):
+                    r = self.post(tecnica, corte, serie, configuracion=fixtures.solicitud_v2(tecnica))
+                    self.assertEqual(r.status_code, estado, r.text)
+                    self.assertEqual(r.json(), {"detail": {"codigo": codigo, "mensaje": api.ERRORES[codigo][1]}})
+                    self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.datos.conteos(), (0, 0, 0, 0, 0))
 
 
 if __name__ == "__main__":

@@ -85,7 +85,8 @@ class SolicitudPronostico(BaseModel):
     configuracion: dict[str, Any] = Field(
         default_factory=dict, strict=True,
         description="Opcional y no nulo. Objeto del contrato F2 con técnica interna coincidente; "
-                    "F3 exige las seis variables originales en su orden. Si se omite, se usan los defaults.",
+                    "admite los grupos canónicos 1/1 (seis variables) y 2/2 (siete variables). "
+                    "Si se omite, se usan los defaults clásicos 1/1.",
         examples=[{"tecnica": "random_forest", "parametros": {"n_estimators": 200, "max_depth": 4, "random_state": 7}}],
     )
 
@@ -213,9 +214,6 @@ def generar(serie_id: Identificador, solicitud: SolicitudPronostico,
             return _respuesta_error("tecnica_invalida")
         try:
             efectiva = configuraciones.normalizar_configuracion(solicitud.configuracion)
-            # Barrera temporal H2-C1: el motor admite 2/2, el POST espera H2-C2.
-            if (efectiva["version_contrato"], efectiva["version_reglas"]) != (1, 1):
-                raise ValueError("El POST solo admite contrato y reglas 1/1.")
             if efectiva["tecnica"] != solicitud.tecnica:
                 raise ValueError("Técnicas diferentes.")
             if solicitud.tecnica != configuraciones.BASE:
