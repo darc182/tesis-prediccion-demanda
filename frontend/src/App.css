@@ -503,6 +503,10 @@
 .forecast-form label { display: block; margin-bottom: 8px; color: var(--text-h); font-weight: 600; }
 .forecast-form select { box-sizing: border-box; width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-h); background: var(--bg); font: inherit; }
 .forecast-form .help-text { grid-column: 1 / -1; }
+.forecast-variable-group { grid-column: 1 / -1; }
+.forecast-variable-help { margin: 0; overflow-wrap: anywhere; }
+.forecast-variable-help p { margin: 0 0 8px; }
+.forecast-variable-help code { display: inline; }
 .forecast-card button { padding: 10px 14px; border: 1px solid var(--accent-border); border-radius: 7px; background: var(--accent-bg); color: var(--text-h); font: inherit; cursor: pointer; }
 .forecast-card button:disabled, .forecast-form select:disabled { opacity: 0.65; cursor: default; }
 .forecast-card button:hover:not(:disabled) { border-color: var(--accent); }

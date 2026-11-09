@@ -11,6 +11,11 @@ const TECNICAS = [
 const CORTES = ['2017-06-16', '2017-07-01', '2017-07-16'] as const
 type Tecnica = typeof TECNICAS[number]['id']
 type Corte = typeof CORTES[number]
+
+type GrupoVariables = 'clasico' | 'ampliado'
+const VARIABLES_CLASICAS = ['lag_1', 'lag_7', 'lag_14', 'media_7', 'dia_semana', 'mes'] as const
+const VARIABLES_AMPLIADAS = [...VARIABLES_CLASICAS, 'media_14'] as const
+type SolicitudEnCurso = { conjuntoId: number; serie: SerieTemporal; tecnica: Tecnica; corte: Corte; grupo: GrupoVariables | null }
 type Metadatos = {
   id: number; experimento_id: number; tecnica: Tecnica; fecha_corte: Corte
   tipo: 'validacion'; horizonte: number; fecha_generacion: string
@@ -163,7 +168,7 @@ function mensajeError(error: unknown, alternativa: string): string {
 
 type PanelProps = {
   seleccion: Seleccion; activo: boolean; pendiente: boolean; revision: number
-  iniciar: (serie: SerieTemporal) => boolean
+  iniciar: (solicitud: SolicitudEnCurso) => boolean
   finalizar: (cambioSeleccion: boolean) => void
 }
 
@@ -171,6 +176,8 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   const { conjuntoId, serie: { id: serieId, store_nbr: tienda, family: familia } } = seleccion
   const [tecnica, setTecnica] = useState<Tecnica>('estacional_semanal_recursiva')
   const [corte, setCorte] = useState<Corte>('2017-06-16')
+  const [grupo, setGrupo] = useState<GrupoVariables>('clasico')
+  const esLineaBase = tecnica === 'estacional_semanal_recursiva'
   const [lista, setLista] = useState<EstadoLista>({ kind: 'loading' })
   const [detalle, setDetalle] = useState<EstadoDetalle>({ kind: 'idle' })
   const [generacion, setGeneracion] = useState<EstadoGeneracion>({ kind: 'idle' })
@@ -242,14 +249,18 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
 
   async function generar(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!esTecnica(tecnica) || !esCorte(corte) || !iniciar(seleccion.serie)) return
+    if (!esTecnica(tecnica) || !esCorte(corte) ||
+        !iniciar({ conjuntoId, serie: seleccion.serie, tecnica, corte, grupo: esLineaBase ? null : grupo })) return
+    const configuracion = !esLineaBase && grupo === 'ampliado' ? {
+      tecnica, version_contrato: 2, version_reglas: 2, variables: VARIABLES_AMPLIADAS,
+    } : null
     setGeneracion({ kind: 'idle' })
     try {
       // Solo la acción de formulario inicia un POST. No se aborta ni reintenta:
       // cerrar una vista no implica cancelar el trabajo que recibe el servidor.
       const response = await fetch(`/api/pronosticos/active/series/${serieId}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tecnica, fecha_corte: corte }),
+        body: JSON.stringify({ tecnica, fecha_corte: corte, ...(configuracion ? { configuracion } : {}) }),
       })
       const body = await leerRespuesta(response)
       if (!vivo.current) return
@@ -278,7 +289,12 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
         <div>
           <label htmlFor="forecast-technique">Técnica</label>
           <select id="forecast-technique" value={tecnica} disabled={pendiente}
-            onChange={event => { if (esTecnica(event.target.value)) setTecnica(event.target.value) }}>
+            onChange={event => {
+              if (!pendiente && esTecnica(event.target.value)) {
+                setTecnica(event.target.value)
+                if (event.target.value === 'estacional_semanal_recursiva') setGrupo('clasico')
+              }
+            }}>
             {TECNICAS.map(t => <option key={t.id} value={t.id}>{t.nombre}</option>)}
           </select>
         </div>
@@ -288,6 +304,28 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
             onChange={event => { if (esCorte(event.target.value)) setCorte(event.target.value) }}>
             {CORTES.map((c, i) => <option key={c} value={c}>{c} · Validación {i + 1}</option>)}
           </select>
+        </div>
+        <div className="forecast-variable-group">
+          <label htmlFor="forecast-variable-group">Grupo de variables predictoras</label>
+          <select id="forecast-variable-group" value={grupo} disabled={pendiente || esLineaBase}
+            aria-describedby="forecast-variable-help"
+            onChange={event => {
+              if (!pendiente && !esLineaBase && (event.target.value === 'clasico' || event.target.value === 'ampliado')) {
+                setGrupo(event.target.value)
+              }
+            }}>
+            {esLineaBase ? <option value="clasico">No aplica a la línea base</option> : <>
+              <option value="clasico">Clásico — 6 variables</option>
+              <option value="ampliado">Ampliado — 7 variables</option>
+            </>}
+          </select>
+        </div>
+        <div id="forecast-variable-help" className="help-text forecast-variable-help">
+          {esLineaBase ? <p>La línea base semanal no utiliza un grupo de variables predictoras configurable.</p> : <>
+            <p>Variables del grupo seleccionado: <code>{(grupo === 'ampliado' ? VARIABLES_AMPLIADAS : VARIABLES_CLASICAS).join(', ')}</code>.</p>
+            <p>El grupo ampliado añade <code>media_14</code>: emplea las catorce fechas naturales anteriores y requiere
+              observaciones para esas fechas. Las fechas sin registro no se sustituyen por ventas cero.</p>
+          </>}
         </div>
         <p className="help-text">Horizonte fijo: quince días naturales desde el día siguiente al corte.</p>
         <button type="submit" disabled={pendiente || !esTecnica(tecnica) || !esCorte(corte)}>Generar pronóstico</button>
@@ -352,13 +390,13 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
 function PronosticosVentas({ seleccion, activo }: Props) {
   // Este contenedor no se reinicia al cambiar de selección: conserva el bloqueo
   // del POST. Solo el panel con resultados usa una clave de conjunto/serie.
-  const [generando, setGenerando] = useState<SerieTemporal | null>(null)
+  const [generando, setGenerando] = useState<SolicitudEnCurso | null>(null)
   const [revision, setRevision] = useState(0)
   const bloqueo = useRef(false)
-  const iniciar = useCallback((serie: SerieTemporal) => {
+  const iniciar = useCallback((solicitud: SolicitudEnCurso) => {
     if (bloqueo.current) return false
     bloqueo.current = true
-    setGenerando(serie)
+    setGenerando(solicitud)
     return true
   }, [])
   const finalizar = useCallback((cambioSeleccion: boolean) => {
@@ -371,7 +409,9 @@ function PronosticosVentas({ seleccion, activo }: Props) {
     <h2 id="forecast-heading">Pronósticos de demanda</h2>
     {generando !== null && <div className="forecast-message" role="status">
       <p>Generando pronóstico. El entrenamiento puede tardar algunos segundos.</p>
-      <p>Solicitud para tienda {generando.store_nbr} · {generando.family}.</p>
+      <p>Solicitud para conjunto {generando.conjuntoId} · tienda {generando.serie.store_nbr} · {generando.serie.family}.</p>
+      <p>{nombreTecnica(generando.tecnica)} · Corte {generando.corte} · {generando.grupo === null
+        ? 'Sin grupo configurable' : generando.grupo === 'ampliado' ? 'Ampliado — 7 variables' : 'Clásico — 6 variables'}.</p>
     </div>}
     {seleccion === null
       ? <p role="status">Seleccione una tienda y una familia válidas para consultar o generar pronósticos.</p>
