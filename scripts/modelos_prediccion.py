@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from math import isfinite
 from numbers import Real
@@ -36,7 +36,8 @@ from scripts.analizar_periodo_seleccion import FIN_SELECCION, HORIZONTE_DIAS, TR
 from scripts.linea_base_prediccion import cargar_historico_csv
 from scripts.preparar_series_modelado import historico_hasta, leer_configuracion
 from scripts.variables_predictoras import (
-    COLUMNAS_PREDICTORAS, construir_tabla_serie, construir_variables_futuras,
+    COLUMNAS_PREDICTORAS, COLUMNAS_PREDICTORAS_ALTERNATIVAS,
+    construir_tabla_serie, construir_variables_futuras,
 )
 from backend.app.services import configuracion_experimentos as configuracion
 
@@ -55,6 +56,11 @@ class ModeloEntrenado:
     filas_descartadas: int
     ultima_fecha_entrenamiento: date
     segundos_entrenamiento: float
+    columnas_predictoras: tuple[str, ...] = field(default=COLUMNAS_PREDICTORAS, kw_only=True)
+
+    def __post_init__(self):
+        # Copiar secuencias del llamador evita conservar listas mutables.
+        object.__setattr__(self, "columnas_predictoras", _columnas_canonicas(self.columnas_predictoras))
 
 
 @dataclass(frozen=True)
@@ -83,8 +89,8 @@ class Resultado:
 def normalizar_configuracion_entrenamiento(tecnica: str, configuracion_solicitada: dict | None = None) -> dict:
     """Valida F2 y las restricciones del motor F3, sin entrenar ni modificar entradas.
 
-    F2 puede identificar permutaciones; este motor solo ejecuta las seis columnas
-    originales en su orden. La configuración de variables corresponde a HU004-H.
+    F2 puede identificar permutaciones históricas v1; F3 solo ejecuta los grupos
+    canónicos: seis columnas con contrato/reglas 1/1 o siete con 2/2.
     """
     if tecnica not in TECNICAS:
         raise ValueError(f"Técnica desconocida: {tecnica}. Opciones: {TECNICAS}")
@@ -92,10 +98,39 @@ def normalizar_configuracion_entrenamiento(tecnica: str, configuracion_solicitad
         {"tecnica": tecnica} if configuracion_solicitada is None else configuracion_solicitada)
     if efectiva["tecnica"] != tecnica:
         raise ValueError("La técnica de la configuración no coincide con la solicitada.")
-    if (tuple(efectiva["variables"]) != COLUMNAS_PREDICTORAS
-            or COLUMNAS_PREDICTORAS != configuracion.VARIABLES):
-        raise ValueError("F3 requiere las seis variables originales en su orden original.")
+    grupos = {
+        (1, 1): COLUMNAS_PREDICTORAS,
+        (2, 2): COLUMNAS_PREDICTORAS_ALTERNATIVAS,
+    }
+    columnas = grupos.get((efectiva["version_contrato"], efectiva["version_reglas"]))
+    if tuple(efectiva["variables"]) != columnas:
+        raise ValueError("F3 requiere las variables canónicas en su orden original para cada contrato.")
     return efectiva
+
+
+def _columnas_canonicas(columnas) -> tuple[str, ...]:
+    if not isinstance(columnas, (tuple, list)):
+        raise ValueError("Las columnas del modelo deben ser un grupo canónico ordenado.")
+    seleccion = tuple(columnas)
+    if seleccion not in (COLUMNAS_PREDICTORAS, COLUMNAS_PREDICTORAS_ALTERNATIVAS):
+        raise ValueError("Las columnas del modelo deben ser un grupo canónico ordenado.")
+    return seleccion
+
+
+def _comprobar_esquema(estimador, columnas: tuple[str, ...]) -> None:
+    """Los regresores reales ajustados deben acreditar dimensión y nombres.
+
+    Los dobles históricos pueden carecer de atributos sklearn. Si los declaran,
+    también deben ser coherentes; nunca se infiere otro grupo desde el estimador.
+    """
+    real = isinstance(estimador, (RandomForestRegressor, HistGradientBoostingRegressor))
+    if real or hasattr(estimador, "n_features_in_"):
+        if getattr(estimador, "n_features_in_", None) != len(columnas):
+            raise ValueError("n_features_in_ no coincide con las columnas del modelo.")
+    if real or hasattr(estimador, "feature_names_in_"):
+        nombres = getattr(estimador, "feature_names_in_", ())
+        if tuple(nombres) != columnas:
+            raise ValueError("feature_names_in_ no coincide con las columnas del modelo y su orden.")
 
 
 def comprobar_parametros_efectivos(estimador, efectiva: dict) -> None:
@@ -124,7 +159,7 @@ def entrenar_modelo(
     datos: pd.DataFrame, store_nbr: int, family: str, tecnica: str, fecha_corte: date,
     *, configuracion_solicitada: dict | None = None,
 ) -> ModeloEntrenado:
-    """Ajusta solo con las seis columnas aprobadas y las respuestas hasta corte.
+    """Ajusta con las columnas del contrato efectivo y las respuestas hasta corte.
 
     Se exige al menos una fila completa para permitir fit. Este mínimo es un
     requisito técnico, no una afirmación sobre suficiencia estadística.
@@ -135,27 +170,36 @@ def entrenar_modelo(
     contexto = f"{store_nbr}/{family}, {tecnica}, corte {fecha_corte}"
     try:
         efectiva = normalizar_configuracion_entrenamiento(tecnica, configuracion_solicitada)
-        preparado = construir_tabla_serie(datos, store_nbr, family, fecha_corte)
+        columnas = tuple(efectiva["variables"])
+        argumentos = {} if columnas == COLUMNAS_PREDICTORAS else {"columnas_predictoras": columnas}
+        preparado = construir_tabla_serie(datos, store_nbr, family, fecha_corte, **argumentos)
+        if preparado.columnas_predictoras != columnas:
+            raise ValueError("Las columnas preparadas no coinciden con la configuración.")
         if preparado.tabla.empty:
             raise ValueError("No hay filas completas de entrenamiento.")
-        x = preparado.tabla.loc[:, list(COLUMNAS_PREDICTORAS)]
+        orden = ("store_nbr", "family", "fecha_objetivo", *columnas, "sales")
+        if tuple(preparado.tabla.columns) != orden:
+            raise ValueError("Las columnas preparadas están incompletas o fuera de orden.")
+        x = preparado.tabla.loc[:, list(columnas)]
         y = preparado.tabla["sales"]
         estimador = crear_estimador(tecnica) if configuracion_solicitada is None else crear_estimador(
             tecnica, configuracion_solicitada=efectiva)
-        if configuracion_solicitada is not None:
+        if callable(getattr(estimador, "get_params", None)):
             comprobar_parametros_efectivos(estimador, efectiva)
         # threadpoolctl es una dependencia de scikit-learn. HGB usa OpenMP
         # y no tiene n_jobs; también limitamos sus hilos durante fit/predict.
         with threadpool_limits(limits=1):
             estimador.fit(x, y)
-        if configuracion_solicitada is not None:
+        if callable(getattr(estimador, "get_params", None)):
             comprobar_parametros_efectivos(estimador, efectiva)
+        _comprobar_esquema(estimador, columnas)
     except (ValueError, TypeError) as error:
         raise ValueError(f"Error de entrenamiento en {contexto}: {error}") from error
     return ModeloEntrenado(
         store_nbr, family, tecnica, fecha_corte, estimador,
         len(preparado.tabla), len(preparado.descartes),
         preparado.tabla["fecha_objetivo"].max(), perf_counter() - inicio,
+        columnas_predictoras=columnas,
     )
 
 
@@ -167,6 +211,8 @@ def pronosticar_recursivo(modelo: ModeloEntrenado, datos: pd.DataFrame) -> tuple
     """
     contexto = f"{modelo.store_nbr}/{modelo.family}, {modelo.tecnica}, corte {modelo.fecha_corte}"
     try:
+        columnas = _columnas_canonicas(modelo.columnas_predictoras)
+        _comprobar_esquema(modelo.estimador, columnas)
         historial = datos.loc[
             pd.to_numeric(datos["store_nbr"], errors="coerce").eq(modelo.store_nbr)
             & datos["family"].eq(modelo.family)
@@ -181,10 +227,15 @@ def pronosticar_recursivo(modelo: ModeloEntrenado, datos: pd.DataFrame) -> tuple
         for paso in range(1, HORIZONTE_DIAS + 1):
             objetivo = modelo.fecha_corte + timedelta(days=paso)
             try:
+                argumentos = {} if columnas == COLUMNAS_PREDICTORAS else {"columnas_predictoras": columnas}
                 x = construir_variables_futuras(
                     historial, modelo.store_nbr, modelo.family,
                     modelo.fecha_corte, objetivo, previas,
-                ).loc[:, list(COLUMNAS_PREDICTORAS)]
+                    **argumentos,
+                )
+                if tuple(x.columns) != columnas:
+                    raise ValueError("Las columnas de predict no coinciden con las columnas de fit y su orden.")
+                _comprobar_esquema(modelo.estimador, columnas)
                 salida = modelo.estimador.predict(x)
                 if len(salida) != 1 or isinstance(salida[0], bool) or not isinstance(salida[0], Real):
                     raise ValueError("El estimador debe devolver un único valor numérico real.")

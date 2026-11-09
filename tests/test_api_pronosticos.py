@@ -193,6 +193,36 @@ class ApiPronosticosTests(unittest.TestCase):
         self.assertEqual(self.ruta.read_bytes(), contenido)
         self.assertEqual(self.datos.conteos(), (0, 0, 0, 0, 0))
 
+    def comprobar_barrera_temporal_v2(self, tecnica):
+        solicitud = {"tecnica": tecnica, "version_contrato": 2, "version_reglas": 2,
+                     "variables": list(configuraciones.VARIABLES_ALTERNATIVAS_V2)}
+        # El contrato y el motor sí reconocen 2/2; solo el POST lo bloquea.
+        self.assertEqual(fixtures.modelos.normalizar_configuracion_entrenamiento(tecnica, solicitud),
+                         configuraciones.normalizar_configuracion(solicitud))
+        contenido = self.ruta.read_bytes()
+        historicos = self.datos.historicos()
+        with patch.object(api, "registrar_pronostico") as registrar, \
+                patch.object(fixtures.modelos, "entrenar_modelo") as entrenar, \
+                patch.object(fixtures.modelos, "normalizar_configuracion_entrenamiento") as motor, \
+                patch.object(registro, "_abrir_base") as abrir:
+            r = self.post(tecnica, configuracion=solicitud)
+            self.assertEqual(r.status_code, 422, r.text)
+            self.assertEqual(r.json(), {"detail": {"codigo": "configuracion_invalida",
+                                                   "mensaje": api.ERRORES["configuracion_invalida"][1]}})
+            registrar.assert_not_called()
+            entrenar.assert_not_called()
+            motor.assert_not_called()
+            abrir.assert_not_called()
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertEqual(self.datos.historicos(), historicos)
+        self.assertEqual(self.datos.conteos(), (0, 0, 0, 0, 0))
+
+    def test_post_rf_v2_bloqueado_temporalmente_sin_motor_registro_ni_escrituras(self):
+        self.comprobar_barrera_temporal_v2("random_forest")
+
+    def test_post_hgb_v2_bloqueado_temporalmente_sin_motor_registro_ni_escrituras(self):
+        self.comprobar_barrera_temporal_v2("hist_gradient_boosting")
+
     def test_hgb_y_linea_base_rechazan_cambios_fijos_y_rangos_de_f2(self):
         casos = [("hist_gradient_boosting", {"early_stopping": True}),
                  ("hist_gradient_boosting", {"max_iter": 501}),

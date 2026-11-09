@@ -213,6 +213,9 @@ def generar(serie_id: Identificador, solicitud: SolicitudPronostico,
             return _respuesta_error("tecnica_invalida")
         try:
             efectiva = configuraciones.normalizar_configuracion(solicitud.configuracion)
+            # Barrera temporal H2-C1: el motor admite 2/2, el POST espera H2-C2.
+            if (efectiva["version_contrato"], efectiva["version_reglas"]) != (1, 1):
+                raise ValueError("El POST solo admite contrato y reglas 1/1.")
             if efectiva["tecnica"] != solicitud.tecnica:
                 raise ValueError("Técnicas diferentes.")
             if solicitud.tecnica != configuraciones.BASE:

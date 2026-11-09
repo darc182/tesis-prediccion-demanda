@@ -739,13 +739,24 @@ class GruposPredictivosTests(unittest.TestCase):
             config.normalizar_configuracion(invalida)
         self.assertEqual(invalida, anterior)
 
-    def test_motor_f3_sigue_rechazando_v2_y_permutaciones_v1_sin_entrenar(self):
-        for tecnica in (RF, HGB):
-            for solicitud in (solicitud_alternativa(tecnica),
-                              {"tecnica": tecnica, "variables": list(reversed(VARIABLES_V1))}):
-                self.assertIsNone(config.validar_configuracion(solicitud))
-                with self.assertRaises(ValueError):
-                    modelos.normalizar_configuracion_entrenamiento(tecnica, solicitud)
+    def test_motor_f3_acepta_v2_canonico_y_rechaza_permutaciones_e_invalidas_sin_entrenar(self):
+        from datetime import date
+        from unittest.mock import patch
+
+        with patch.object(modelos, "crear_estimador") as crear:
+            for tecnica in (RF, HGB):
+                solicitud = solicitud_alternativa(tecnica)
+                self.assertEqual(modelos.normalizar_configuracion_entrenamiento(tecnica, solicitud),
+                                 config.normalizar_configuracion(solicitud))
+                permutada = {"tecnica": tecnica, "variables": list(reversed(VARIABLES_V1))}
+                self.assertIsNone(config.validar_configuracion(permutada))
+                for invalida in (permutada, {**solicitud, "version_reglas": 1},
+                                 {**solicitud, "variables": list(VARIABLES_V1)},
+                                 {**solicitud, "variables": list(reversed(VARIABLES_V2))}):
+                    with self.subTest(tecnica=tecnica, solicitud=invalida), self.assertRaises(ValueError):
+                        modelos.entrenar_modelo(None, 1, "A", tecnica, date(2017, 6, 16),
+                                                configuracion_solicitada=invalida)
+            crear.assert_not_called()
 
 
 if __name__ == "__main__":
