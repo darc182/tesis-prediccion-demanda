@@ -15,7 +15,48 @@ type Corte = typeof CORTES[number]
 type GrupoVariables = 'clasico' | 'ampliado'
 const VARIABLES_CLASICAS = ['lag_1', 'lag_7', 'lag_14', 'media_7', 'dia_semana', 'mes'] as const
 const VARIABLES_AMPLIADAS = [...VARIABLES_CLASICAS, 'media_14'] as const
-type SolicitudEnCurso = { conjuntoId: number; serie: SerieTemporal; tecnica: Tecnica; corte: Corte; grupo: GrupoVariables | null }
+type ParametrosSolicitados = Record<string, number | null>
+type BorradorRF = { n_estimators: string; max_depth: string; min_samples_leaf: string }
+type BorradorHGB = { max_iter: string; learning_rate: string; max_depth: string }
+// Valores y límites de configuracion_experimentos.py; el backend sigue validando.
+const INICIAL_RF: BorradorRF = { n_estimators: '100', max_depth: '', min_samples_leaf: '5' }
+const INICIAL_HGB: BorradorHGB = { max_iter: '100', learning_rate: '0.05', max_depth: '' }
+
+function numeroEnRango(texto: string, minimo: number, maximo: number, entero = true): number | null {
+  const valor = Number(texto)
+  return texto.trim() !== '' && Number.isFinite(valor) && valor >= minimo && valor <= maximo &&
+    (!entero || Number.isInteger(valor)) ? valor : null
+}
+
+function resolverParametros(tecnica: Tecnica, rf: BorradorRF, hgb: BorradorHGB): ParametrosSolicitados | null {
+  if (tecnica === 'estacional_semanal_recursiva') return {}
+  const textoProfundidad = tecnica === 'random_forest' ? rf.max_depth : hgb.max_depth
+  const profundidad = textoProfundidad.trim() === '' ? null : numeroEnRango(textoProfundidad, 1, 50)
+  if (textoProfundidad.trim() !== '' && profundidad === null) return null
+  let valores: ParametrosSolicitados
+  let predeterminados: ParametrosSolicitados
+  if (tecnica === 'random_forest') {
+    const arboles = numeroEnRango(rf.n_estimators, 1, 500)
+    const hoja = numeroEnRango(rf.min_samples_leaf, 1, 100)
+    if (arboles === null || hoja === null) return null
+    valores = { n_estimators: arboles, max_depth: profundidad, min_samples_leaf: hoja }
+    predeterminados = { n_estimators: Number(INICIAL_RF.n_estimators), max_depth: null,
+      min_samples_leaf: Number(INICIAL_RF.min_samples_leaf) }
+  } else {
+    const iteraciones = numeroEnRango(hgb.max_iter, 1, 500)
+    const tasa = numeroEnRango(hgb.learning_rate, 0.001, 1, false)
+    if (iteraciones === null || tasa === null) return null
+    valores = { max_iter: iteraciones, learning_rate: tasa, max_depth: profundidad }
+    predeterminados = { max_iter: Number(INICIAL_HGB.max_iter), learning_rate: Number(INICIAL_HGB.learning_rate), max_depth: null }
+  }
+  // Solo diferencias efectivas: 100.0 equivale a 100; vacío en profundidad es null.
+  return Object.fromEntries(Object.entries(valores).filter(([nombre, valor]) => valor !== predeterminados[nombre]))
+}
+
+type SolicitudEnCurso = {
+  conjuntoId: number; serie: SerieTemporal; tecnica: Tecnica; corte: Corte
+  grupo: GrupoVariables | null; parametros: ParametrosSolicitados
+}
 type Metadatos = {
   id: number; experimento_id: number; tecnica: Tecnica; fecha_corte: Corte
   tipo: 'validacion'; horizonte: number; fecha_generacion: string
@@ -177,7 +218,11 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   const [tecnica, setTecnica] = useState<Tecnica>('estacional_semanal_recursiva')
   const [corte, setCorte] = useState<Corte>('2017-06-16')
   const [grupo, setGrupo] = useState<GrupoVariables>('clasico')
+  const [rf, setRf] = useState<BorradorRF>(() => ({ ...INICIAL_RF }))
+  const [hgb, setHgb] = useState<BorradorHGB>(() => ({ ...INICIAL_HGB }))
   const esLineaBase = tecnica === 'estacional_semanal_recursiva'
+  const parametros = resolverParametros(tecnica, rf, hgb)
+  const modificados = parametros !== null && Object.keys(parametros).length > 0
   const [lista, setLista] = useState<EstadoLista>({ kind: 'loading' })
   const [detalle, setDetalle] = useState<EstadoDetalle>({ kind: 'idle' })
   const [generacion, setGeneracion] = useState<EstadoGeneracion>({ kind: 'idle' })
@@ -249,10 +294,12 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
 
   async function generar(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!esTecnica(tecnica) || !esCorte(corte) ||
-        !iniciar({ conjuntoId, serie: seleccion.serie, tecnica, corte, grupo: esLineaBase ? null : grupo })) return
-    const configuracion = !esLineaBase && grupo === 'ampliado' ? {
-      tecnica, version_contrato: 2, version_reglas: 2, variables: VARIABLES_AMPLIADAS,
+    if (!esTecnica(tecnica) || !esCorte(corte) || parametros === null || !event.currentTarget.reportValidity() ||
+        !iniciar({ conjuntoId, serie: seleccion.serie, tecnica, corte, grupo: esLineaBase ? null : grupo, parametros })) return
+    const configuracion = !esLineaBase && (grupo === 'ampliado' || modificados) ? {
+      tecnica, version_contrato: grupo === 'ampliado' ? 2 : 1, version_reglas: grupo === 'ampliado' ? 2 : 1,
+      variables: grupo === 'ampliado' ? VARIABLES_AMPLIADAS : VARIABLES_CLASICAS,
+      ...(modificados ? { parametros } : {}),
     } : null
     setGeneracion({ kind: 'idle' })
     try {
@@ -327,8 +374,74 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
               observaciones para esas fechas. Las fechas sin registro no se sustituyen por ventas cero.</p>
           </>}
         </div>
+        {!esLineaBase && <fieldset className="forecast-parameters" disabled={pendiente}
+          aria-describedby="forecast-parameters-help">
+          <legend>Hiperparámetros de {nombreTecnica(tecnica)}</legend>
+          <div className="forecast-parameter-fields">
+            {tecnica === 'random_forest' ? <>
+              <div>
+                <label htmlFor="forecast-n-estimators">Número de árboles (n_estimators)</label>
+                <input id="forecast-n-estimators" type="number" min="1" max="500" step="1" required
+                  value={rf.n_estimators} aria-describedby="forecast-n-estimators-help"
+                  aria-invalid={numeroEnRango(rf.n_estimators, 1, 500) === null}
+                  onChange={event => { if (!pendiente) setRf({ ...rf, n_estimators: event.target.value }) }} />
+                <p id="forecast-n-estimators-help" className="help-text">Entero de 1 a 500. Predeterminado: 100.</p>
+              </div>
+              <div>
+                <label htmlFor="forecast-min-samples-leaf">Mínimo de muestras por hoja (min_samples_leaf)</label>
+                <input id="forecast-min-samples-leaf" type="number" min="1" max="100" step="1" required
+                  value={rf.min_samples_leaf} aria-describedby="forecast-min-samples-leaf-help"
+                  aria-invalid={numeroEnRango(rf.min_samples_leaf, 1, 100) === null}
+                  onChange={event => { if (!pendiente) setRf({ ...rf, min_samples_leaf: event.target.value }) }} />
+                <p id="forecast-min-samples-leaf-help" className="help-text">Entero de 1 a 100. Predeterminado: 5.</p>
+              </div>
+            </> : <>
+              <div>
+                <label htmlFor="forecast-max-iter">Iteraciones (max_iter)</label>
+                <input id="forecast-max-iter" type="number" min="1" max="500" step="1" required
+                  value={hgb.max_iter} aria-describedby="forecast-max-iter-help"
+                  aria-invalid={numeroEnRango(hgb.max_iter, 1, 500) === null}
+                  onChange={event => { if (!pendiente) setHgb({ ...hgb, max_iter: event.target.value }) }} />
+                <p id="forecast-max-iter-help" className="help-text">Entero de 1 a 500. Predeterminado: 100.</p>
+              </div>
+              <div>
+                <label htmlFor="forecast-learning-rate">Tasa de aprendizaje (learning_rate)</label>
+                <input id="forecast-learning-rate" type="number" min="0.001" max="1" step="any" required
+                  value={hgb.learning_rate} aria-describedby="forecast-learning-rate-help"
+                  aria-invalid={numeroEnRango(hgb.learning_rate, 0.001, 1, false) === null}
+                  onChange={event => { if (!pendiente) setHgb({ ...hgb, learning_rate: event.target.value }) }} />
+                <p id="forecast-learning-rate-help" className="help-text">Entre 0,001 y 1. Predeterminado: 0,05.</p>
+              </div>
+            </>}
+            <div>
+              <label htmlFor="forecast-max-depth">Profundidad máxima (max_depth)</label>
+              <input id="forecast-max-depth" type="number" min="1" max="50" step="1" placeholder="Sin límite"
+                value={tecnica === 'random_forest' ? rf.max_depth : hgb.max_depth}
+                aria-describedby="forecast-max-depth-help"
+                aria-invalid={(tecnica === 'random_forest' ? rf.max_depth : hgb.max_depth).trim() !== '' &&
+                  numeroEnRango(tecnica === 'random_forest' ? rf.max_depth : hgb.max_depth, 1, 50) === null}
+                onChange={event => {
+                  if (!pendiente) {
+                    if (tecnica === 'random_forest') setRf({ ...rf, max_depth: event.target.value })
+                    else setHgb({ ...hgb, max_depth: event.target.value })
+                  }
+                }} />
+              <p id="forecast-max-depth-help" className="help-text">Vacío: sin límite, el valor predeterminado. O entero de 1 a 50.</p>
+            </div>
+          </div>
+          <p id="forecast-parameters-help" className="help-text">Los demás parámetros conservan sus valores predeterminados. Los valores se validan antes de generar.</p>
+          <p className="forecast-parameter-state" role="status">{parametros === null
+            ? 'Hay parámetros inválidos. Revisa los límites indicados antes de generar.'
+            : modificados ? 'Configuración de hiperparámetros modificada.' : 'Hiperparámetros predeterminados.'}</p>
+          <button type="button" onClick={() => {
+            if (!pendiente) {
+              if (tecnica === 'random_forest') setRf({ ...INICIAL_RF })
+              else setHgb({ ...INICIAL_HGB })
+            }
+          }}>Restablecer parámetros de {nombreTecnica(tecnica)}</button>
+        </fieldset>}
         <p className="help-text">Horizonte fijo: quince días naturales desde el día siguiente al corte.</p>
-        <button type="submit" disabled={pendiente || !esTecnica(tecnica) || !esCorte(corte)}>Generar pronóstico</button>
+        <button type="submit" disabled={pendiente || parametros === null || !esTecnica(tecnica) || !esCorte(corte)}>Generar pronóstico</button>
       </form>
       {generacion.kind !== 'idle' && <p className={`forecast-message forecast-message--${generacion.kind}`}
         role={generacion.kind === 'error' ? 'alert' : 'status'}>{generacion.message}</p>}
@@ -412,6 +525,8 @@ function PronosticosVentas({ seleccion, activo }: Props) {
       <p>Solicitud para conjunto {generando.conjuntoId} · tienda {generando.serie.store_nbr} · {generando.serie.family}.</p>
       <p>{nombreTecnica(generando.tecnica)} · Corte {generando.corte} · {generando.grupo === null
         ? 'Sin grupo configurable' : generando.grupo === 'ampliado' ? 'Ampliado — 7 variables' : 'Clásico — 6 variables'}.</p>
+      {generando.grupo !== null && <p>{Object.keys(generando.parametros).length === 0 ? 'Hiperparámetros predeterminados.'
+        : `Parámetros solicitados: ${Object.entries(generando.parametros).map(([nombre, valor]) => `${nombre}=${valor}`).join(', ')}.`}</p>}
     </div>}
     {seleccion === null
       ? <p role="status">Seleccione una tienda y una familia válidas para consultar o generar pronósticos.</p>
