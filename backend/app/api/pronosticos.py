@@ -3,9 +3,9 @@
 from dataclasses import asdict
 from pathlib import Path
 import sqlite3
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Path as ParametroRuta, Request
+from fastapi import APIRouter, Depends, Path as ParametroRuta, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
@@ -13,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.app.api.datasets import obtener_ruta_base
 from backend.app.services import configuracion_experimentos as configuraciones
+from backend.app.services.consulta_filas_entrenamiento import (
+    ErrorConsultaFilas, consultar_filas_entrenamiento,
+)
 from backend.app.services.consulta_pronosticos import (
     ErrorConsultaPronostico, consultar_configuracion_pronostico, consultar_pronostico, listar_pronosticos,
 )
@@ -23,6 +26,9 @@ from backend.app.services.registro_pronosticos import (
 
 # Solo mensajes públicos fijos: nunca se devuelve str(error) de los servicios.
 ERRORES = {
+    "grupo_invalido": (422, "El grupo de variables debe ser clasico o ampliado."),
+    "entrada_filas_invalida": (422, "Indique únicamente fecha_corte y grupo, una vez cada uno."),
+    "historial_invalido": (409, "Las observaciones históricas presentan datos inconsistentes."),
     "entrada_invalida": (422, "Revise los identificadores y el cuerpo: técnica y fecha de corte YYYY-MM-DD son obligatorias."),
     "configuracion_invalida": (422, "La configuración debe ser un objeto válido para la técnica solicitada y conservar las variables y reglas admitidas."),
     "serie_invalida": (422, "El identificador de serie debe ser un entero positivo."),
@@ -63,16 +69,29 @@ class RutaPronosticos(APIRoute):
             try:
                 return await original(request)
             except RequestValidationError as error:
+                if self.name == "filas_entrenamiento":
+                    ubicaciones = [e["loc"] for e in error.errors()]
+                    if ("path", "serie_id") in ubicaciones:
+                        return _respuesta_error("serie_invalida")
+                    if ("query", "fecha_corte") in ubicaciones:
+                        return _respuesta_error("corte_invalido")
+                    return _respuesta_error("grupo_invalido")
                 if any(e["loc"][:2] == ("body", "configuracion") for e in error.errors()):
                     return _respuesta_error("configuracion_invalida")
                 return _respuesta_error("entrada_invalida")
-            except (ErrorRegistroPronostico, ErrorConsultaPronostico) as error:
+            except (ErrorRegistroPronostico, ErrorConsultaPronostico, ErrorConsultaFilas) as error:
                 return _respuesta_error(error.codigo)
             except (sqlite3.Error, OSError):
                 return _respuesta_error("base_no_disponible")
             except Exception:
                 return _respuesta_error("error_interno")
 
+        if self.name == "filas_entrenamiento":
+            async def sin_cache(request: Request):
+                respuesta = await manejar(request)
+                respuesta.headers["Cache-Control"] = "no-store"
+                return respuesta
+            return sin_cache
         return manejar
 
 
@@ -95,6 +114,21 @@ class Serie(BaseModel):
     id: int
     store_nbr: int
     family: str
+
+
+class FilasEntrenamiento(BaseModel):
+    conjunto_id: int
+    serie: Serie
+    fecha_corte: str
+    grupo: Literal["clasico", "ampliado"]
+    version_contrato: int
+    version_reglas: int
+    variables: list[str]
+    observaciones_historicas: int = Field(ge=0)
+    filas_aptas: int = Field(ge=0)
+    filas_descartadas: int = Field(ge=0)
+    descartes_por_variable: dict[str, int] = Field(
+        description="Filas con cada variable ausente. Los conteos pueden solaparse y no deben sumarse.")
 
 
 class MetadatosPronostico(BaseModel):
@@ -181,6 +215,21 @@ RESPUESTAS_ERROR = {codigo: {"model": RespuestaError, "description": descripcion
 
 router = APIRouter(prefix="/api/pronosticos", tags=["pronosticos"], route_class=RutaPronosticos)
 Identificador = Annotated[int, ParametroRuta(gt=0)]
+
+
+@router.get("/active/series/{serie_id}/filas-entrenamiento", response_model=FilasEntrenamiento,
+            responses=RESPUESTAS_ERROR)
+def filas_entrenamiento(
+    request: Request, serie_id: Identificador,
+    fecha_corte: Annotated[str, Query(description="Corte de validación autorizado en formato YYYY-MM-DD.")],
+    grupo: Annotated[Literal["clasico", "ampliado"], Query()],
+    ruta_base: Path = Depends(obtener_ruta_base),
+):
+    """Consulta disponibilidad de ejemplos de regresión sin entrenar ni escribir."""
+    if (set(request.query_params) != {"fecha_corte", "grupo"}
+            or any(len(request.query_params.getlist(k)) != 1 for k in ("fecha_corte", "grupo"))):
+        return _respuesta_error("entrada_filas_invalida")
+    return consultar_filas_entrenamiento(ruta_base, serie_id, fecha_corte, grupo)
 
 
 @router.get("/active/series/{serie_id}", response_model=ListaPronosticos, responses=RESPUESTAS_ERROR)
