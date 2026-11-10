@@ -1,6 +1,8 @@
 """API explícita de generación y consulta; no ejecuta operaciones al importar."""
 
 from dataclasses import asdict
+from copy import deepcopy
+from datetime import date
 from pathlib import Path
 import sqlite3
 from typing import Annotated, Any, Literal
@@ -9,7 +11,7 @@ from fastapi import APIRouter, Depends, Path as ParametroRuta, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 from backend.app.api.datasets import obtener_ruta_base
 from backend.app.services import configuracion_experimentos as configuraciones
@@ -22,10 +24,15 @@ from backend.app.services.consulta_pronosticos import (
 from backend.app.services.registro_pronosticos import (
     TECNICAS, ErrorRegistroPronostico, registrar_pronostico,
 )
+from backend.app.services.ejecucion_bateria_pronosticos import ErrorEjecucionBateria, ejecutar_bateria
+from backend.app.services.validacion_csv import MAX_ENTERO_SQLITE
 
 
 # Solo mensajes públicos fijos: nunca se devuelve str(error) de los servicios.
 ERRORES = {
+    "entrada_bateria_invalida": (422, "Indique únicamente conjunto_id y fecha_corte con tipos válidos."),
+    "conjunto_invalido": (422, "El identificador de conjunto debe ser un entero positivo válido."),
+    "conjunto_inactivo": (409, "El conjunto solicitado no es el activo. Actualice la selección."),
     "grupo_invalido": (422, "El grupo de variables debe ser clasico o ampliado."),
     "entrada_filas_invalida": (422, "Indique únicamente fecha_corte y grupo, una vez cada uno."),
     "historial_invalido": (409, "Las observaciones históricas presentan datos inconsistentes."),
@@ -69,6 +76,15 @@ class RutaPronosticos(APIRoute):
             try:
                 return await original(request)
             except RequestValidationError as error:
+                if self.name == "generar_bateria":
+                    ubicaciones = [e["loc"] for e in error.errors()]
+                    if ("path", "serie_id") in ubicaciones:
+                        return _respuesta_error("serie_invalida")
+                    if ("body", "conjunto_id") in ubicaciones:
+                        return _respuesta_error("conjunto_invalido")
+                    if ("body", "fecha_corte") in ubicaciones:
+                        return _respuesta_error("corte_invalido")
+                    return _respuesta_error("entrada_bateria_invalida")
                 if self.name == "filas_entrenamiento":
                     ubicaciones = [e["loc"] for e in error.errors()]
                     if ("path", "serie_id") in ubicaciones:
@@ -81,12 +97,14 @@ class RutaPronosticos(APIRoute):
                 return _respuesta_error("entrada_invalida")
             except (ErrorRegistroPronostico, ErrorConsultaPronostico, ErrorConsultaFilas) as error:
                 return _respuesta_error(error.codigo)
+            except ErrorEjecucionBateria as error:
+                return _respuesta_error(error.codigo)
             except (sqlite3.Error, OSError):
                 return _respuesta_error("base_no_disponible")
             except Exception:
                 return _respuesta_error("error_interno")
 
-        if self.name == "filas_entrenamiento":
+        if self.name in {"filas_entrenamiento", "generar_bateria"}:
             async def sin_cache(request: Request):
                 respuesta = await manejar(request)
                 respuesta.headers["Cache-Control"] = "no-store"
@@ -207,6 +225,96 @@ class RespuestaError(BaseModel):
     detail: DetalleError
 
 
+class SolicitudBateria(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    conjunto_id: int = Field(strict=True, gt=0, le=MAX_ENTERO_SQLITE)
+    fecha_corte: str = Field(strict=True, pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+    @field_validator("fecha_corte")
+    @classmethod
+    def fecha_canonica(cls, valor):
+        if date.fromisoformat(valor).isoformat() != valor:
+            raise ValueError("Fecha no canónica.")
+        return valor
+
+
+class ElementoBateria(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    orden: int = Field(ge=1, le=5)
+    conjunto_id: int
+    serie_id: int
+    fecha_corte: str
+    tecnica: str
+    configuracion: ConfiguracionPredictiva
+    variables: list[str]
+    version_contrato: int
+    version_reglas: int
+    horizonte: Literal[15]
+    identidad_predictiva: str = Field(pattern=r"^[0-9a-f]{64}$")
+    estado: Literal["creado", "reutilizado", "fallido", "no_ejecutado"]
+    duracion_segundos: float | None = Field(ge=0, allow_inf_nan=False)
+    experimento_id: int | None = Field(default=None, strict=True, gt=0)
+    pronostico_id: int | None = Field(default=None, strict=True, gt=0)
+    error: DetalleError | None = None
+
+
+class ResumenBateria(BaseModel):
+    creado: int = Field(ge=0, le=5)
+    reutilizado: int = Field(ge=0, le=5)
+    fallido: int = Field(ge=0, le=5)
+    no_ejecutado: int = Field(ge=0, le=5)
+
+
+class ResultadoBateria(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    conjunto_id: int
+    serie_id: int
+    fecha_corte: str
+    horizonte: Literal[15]
+    estado: Literal["completa", "parcial", "interrumpida"]
+    contexto_verificado: bool
+    resultados: list[ElementoBateria] = Field(min_length=5, max_length=5)
+    resumen: ResumenBateria
+    interrupcion: DetalleError | None
+    duracion_segundos: float = Field(ge=0, allow_inf_nan=False)
+
+
+def _error_publico_bateria(error):
+    codigo = error.get("codigo")
+    publico = ErrorEjecucionBateria(codigo if type(codigo) is str else "error_interno")
+    return DetalleError(codigo=publico.codigo, mensaje=str(publico))
+
+
+def _bateria_publica(resultado):
+    """Proyección por campos: no serializa auditoría ni modifica el servicio."""
+    elementos = []
+    for origen in resultado["resultados"]:
+        cfg = origen["configuracion"]
+        parametros = configuraciones.configuracion_predeterminada(cfg["tecnica"])["parametros"]
+        configuracion = ConfiguracionPredictiva(
+            tecnica=cfg["tecnica"], version_contrato=cfg["version_contrato"],
+            version_reglas=cfg["version_reglas"], horizonte=cfg["horizonte"],
+            variables=list(cfg["variables"]),
+            parametros={k: deepcopy(cfg["parametros"][k]) for k in parametros})
+        datos = {k: deepcopy(origen[k]) for k in (
+            "orden", "conjunto_id", "serie_id", "fecha_corte", "tecnica", "variables",
+            "version_contrato", "version_reglas", "horizonte", "identidad_predictiva",
+            "estado", "duracion_segundos")}
+        datos["configuracion"] = configuracion
+        if origen["estado"] in {"creado", "reutilizado"}:
+            datos.update({k: origen[k] for k in ("experimento_id", "pronostico_id")})
+        elif origen["estado"] == "fallido":
+            datos["error"] = _error_publico_bateria(origen["error"])
+        elementos.append(ElementoBateria(**datos))
+    return ResultadoBateria(
+        **{k: resultado[k] for k in ("conjunto_id", "serie_id", "fecha_corte", "horizonte",
+                                    "estado", "contexto_verificado", "duracion_segundos")},
+        resultados=elementos,
+        resumen=ResumenBateria(**{k: resultado["resumen"][k]
+                                for k in ("creado", "reutilizado", "fallido", "no_ejecutado")}),
+        interrupcion=None if resultado["interrupcion"] is None else _error_publico_bateria(resultado["interrupcion"]))
+
+
 RESPUESTAS_ERROR = {codigo: {"model": RespuestaError, "description": descripcion}
                     for codigo, descripcion in (
                         (422, "Solicitud inválida"), (404, "Recurso no disponible en el conjunto activo"),
@@ -215,6 +323,31 @@ RESPUESTAS_ERROR = {codigo: {"model": RespuestaError, "description": descripcion
 
 router = APIRouter(prefix="/api/pronosticos", tags=["pronosticos"], route_class=RutaPronosticos)
 Identificador = Annotated[int, ParametroRuta(gt=0)]
+
+
+def _entero_ruta_bateria(valor):
+    if type(valor) is not str or not valor.isascii() or not valor.isdecimal():
+        raise ValueError("Identificador no entero.")
+    return valor
+
+
+@router.post("/active/series/{serie_id}/bateria", response_model=ResultadoBateria,
+             response_model_exclude_unset=True, responses=RESPUESTAS_ERROR)
+def generar_bateria(
+    serie_id: Annotated[int, ParametroRuta(gt=0, le=MAX_ENTERO_SQLITE), BeforeValidator(_entero_ruta_bateria)],
+    solicitud: SolicitudBateria, ruta_base: Path = Depends(obtener_ruta_base),
+):
+    """Ejecuta explícitamente cinco configuraciones, de forma síncrona.
+
+    HTTP 200 conserva completa/parcial/interrumpida; no es una transacción
+    global. Reutilizar puede volver a entrenar. No hay cancelación inmediata:
+    una desconexión no acredita ni parada ni finalización. Los registros
+    individuales confirmados pueden consultarse por GET si siguen activos.
+    No se garantiza que baterías simultáneas tengan el mismo reparto de estados.
+    Respuestas y errores llevan Cache-Control: no-store.
+    """
+    resultado = ejecutar_bateria(ruta_base, solicitud.conjunto_id, serie_id, solicitud.fecha_corte)
+    return _bateria_publica(resultado)
 
 
 @router.get("/active/series/{serie_id}/filas-entrenamiento", response_model=FilasEntrenamiento,
