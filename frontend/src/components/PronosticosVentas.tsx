@@ -53,10 +53,10 @@ function resolverParametros(tecnica: Tecnica, rf: BorradorRF, hgb: BorradorHGB):
   return Object.fromEntries(Object.entries(valores).filter(([nombre, valor]) => valor !== predeterminados[nombre]))
 }
 
-type SolicitudEnCurso = {
-  conjuntoId: number; serie: SerieTemporal; tecnica: Tecnica; corte: Corte
-  grupo: GrupoVariables | null; parametros: ParametrosSolicitados
-}
+type SolicitudEnCurso = Seleccion & { corte: Corte } & (
+  { tipo: 'individual'; tecnica: Tecnica; grupo: GrupoVariables | null; parametros: ParametrosSolicitados } |
+  { tipo: 'bateria' }
+)
 type Metadatos = {
   id: number; experimento_id: number; tecnica: Tecnica; fecha_corte: Corte
   tipo: 'validacion'; horizonte: number; fecha_generacion: string
@@ -69,6 +69,48 @@ type EstadoLista = { kind: 'loading' } | { kind: 'error'; message: string } | { 
 type EstadoDetalle = { kind: 'idle' } | { kind: 'loading'; id: number } |
   { kind: 'error'; message: string } | { kind: 'success'; data: RespuestaDetalle }
 type EstadoGeneracion = { kind: 'idle' } | { kind: 'success' | 'error'; message: string }
+const ESTADOS_ELEMENTO = ['creado', 'reutilizado', 'fallido', 'no_ejecutado'] as const
+type EstadoElemento = typeof ESTADOS_ELEMENTO[number]
+type ErrorPublico = { codigo: string; mensaje: string }
+type ElementoBateria = { tecnica: Tecnica; version_contrato: number } & (
+  { estado: 'creado' | 'reutilizado'; duracion_segundos: number; experimento_id: number; pronostico_id: number } |
+  { estado: 'fallido'; duracion_segundos: number; error: ErrorPublico } |
+  { estado: 'no_ejecutado'; duracion_segundos: null }
+)
+type ResultadoBateria = {
+  fecha_corte: Corte; estado: 'completa' | 'parcial' | 'interrumpida'
+  resultados: ElementoBateria[]; resumen: Record<EstadoElemento, number>; interrupcion: ErrorPublico | null
+}
+type EstadoBateria = { kind: 'idle' } | { kind: 'success'; data: ResultadoBateria } |
+  { kind: 'error'; message: string }
+const ORDEN_BATERIA = TECNICAS.flatMap<{ tecnica: Tecnica; version: number }>(({ id }) => id === 'estacional_semanal_recursiva'
+  ? [{ tecnica: id, version: 1 }]
+  : [{ tecnica: id, version: 1 }, { tecnica: id, version: 2 }])
+const ETIQUETAS_ELEMENTO: Record<EstadoElemento, string> = {
+  creado: 'Creado', reutilizado: 'Reutilizado', fallido: 'Fallido', no_ejecutado: 'No ejecutado',
+}
+// Los mensajes se seleccionan por código público, sin presentar texto arbitrario de la respuesta.
+const ERRORES_BATERIA: Readonly<Record<string, string>> = {
+  entrada_bateria_invalida: 'Revise el conjunto y la fecha de corte.',
+  conjunto_invalido: 'El identificador de conjunto no es válido.',
+  serie_invalida: 'El identificador de serie no es válido.',
+  corte_invalido: 'La fecha de corte no es válida.',
+  corte_no_autorizado: 'El corte de validación no está autorizado.',
+  prueba_reservada: 'La prueba final permanece reservada.',
+  sin_conjunto_activo: 'No existe un conjunto activo.',
+  conjunto_inactivo: 'El conjunto solicitado no es el activo. Actualice la selección.',
+  serie_inexistente: 'La serie no existe en el conjunto activo.',
+  serie_inactiva: 'La serie no pertenece al conjunto activo.',
+  sin_historial: 'La serie no tiene observaciones hasta el corte.',
+  historial_invalido: 'Las observaciones históricas presentan datos inconsistentes.',
+  historial_cambiado: 'El conjunto, la serie o el histórico cambiaron.',
+  base_no_disponible: 'La base de datos no está disponible o no tiene el esquema necesario.',
+  error_calculo: 'El histórico no permite calcular este pronóstico.',
+  resultado_invalido: 'El registro no acreditó un resultado válido para la configuración solicitada.',
+  conflicto: 'Existe un pronóstico conflictivo. No se sobrescribió.',
+  error_persistencia: 'No se pudo completar el registro de este pronóstico.',
+  error_interno: 'No se pudo completar la ejecución de la batería.',
+}
 type Disponibilidad = {
   conjunto_id: number; serie: SerieTemporal; fecha_corte: Corte; grupo: GrupoVariables
   version_contrato: number; version_reglas: number; variables: string[]
@@ -116,6 +158,76 @@ function mismaSeleccion(value: unknown, seleccion: Seleccion): boolean {
 }
 function conteoValido(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+function mensajeBateria(codigo: string): string | undefined {
+  return Object.hasOwn(ERRORES_BATERIA, codigo) ? ERRORES_BATERIA[codigo] : undefined
+}
+function esErrorPublico(value: unknown): value is ErrorPublico {
+  return registro(value) && typeof value.codigo === 'string' && typeof value.mensaje === 'string' &&
+    value.mensaje.trim().length > 0 && mensajeBateria(value.codigo) !== undefined
+}
+function duracionValida(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+function esResultadoBateria(value: unknown, seleccion: Seleccion, corte: Corte): value is ResultadoBateria {
+  if (!registro(value) || value.conjunto_id !== seleccion.conjuntoId || value.serie_id !== seleccion.serie.id ||
+      value.fecha_corte !== corte || value.horizonte !== 15 || !duracionValida(value.duracion_segundos) ||
+      !Array.isArray(value.resultados) || value.resultados.length !== ORDEN_BATERIA.length ||
+      !registro(value.resumen)) return false
+
+  const conteos = { creado: 0, reutilizado: 0, fallido: 0, no_ejecutado: 0 }
+  const experimentos = new Set<number>()
+  const pronosticos = new Set<number>()
+  const identidades = new Set<string>()
+  let debenQuedarPendientes = false
+  for (const [indice, item] of value.resultados.entries()) {
+    const { tecnica, version } = ORDEN_BATERIA[indice]
+    const variables = tecnica === 'estacional_semanal_recursiva' ? [] :
+      version === 1 ? VARIABLES_CLASICAS : VARIABLES_AMPLIADAS
+    const columnasValidas = (columnas: unknown) => Array.isArray(columnas) && columnas.length === variables.length &&
+      columnas.every((nombre, i) => nombre === variables[i])
+    if (!registro(item) || item.orden !== indice + 1 || item.conjunto_id !== seleccion.conjuntoId ||
+        item.serie_id !== seleccion.serie.id || item.fecha_corte !== corte || item.horizonte !== 15 ||
+        item.tecnica !== tecnica || item.version_contrato !== version || item.version_reglas !== version ||
+        !columnasValidas(item.variables) || typeof item.identidad_predictiva !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(item.identidad_predictiva) || identidades.has(item.identidad_predictiva)) return false
+    identidades.add(item.identidad_predictiva)
+
+    const config = item.configuracion
+    if (!registro(config) || config.tecnica !== tecnica || config.horizonte !== 15 ||
+        config.version_contrato !== version || config.version_reglas !== version || !columnasValidas(config.variables) ||
+        !registro(config.parametros) || Object.keys(config.parametros).length === 0 ||
+        !Object.values(config.parametros).every(p => p === null || typeof p === 'boolean' || typeof p === 'string' ||
+          (typeof p === 'number' && Number.isFinite(p)))) return false
+
+    if (debenQuedarPendientes && item.estado !== 'no_ejecutado') return false
+    if (item.estado === 'creado' || item.estado === 'reutilizado') {
+      if (!idValido(item.experimento_id) || !idValido(item.pronostico_id) || !duracionValida(item.duracion_segundos) ||
+          experimentos.has(item.experimento_id) || pronosticos.has(item.pronostico_id) || Object.hasOwn(item, 'error')) return false
+      experimentos.add(item.experimento_id)
+      pronosticos.add(item.pronostico_id)
+      conteos[item.estado]++
+      continue
+    }
+    if (Object.hasOwn(item, 'experimento_id') || Object.hasOwn(item, 'pronostico_id')) return false
+    if (item.estado === 'fallido') {
+      if (!esErrorPublico(item.error) || !duracionValida(item.duracion_segundos)) return false
+      debenQuedarPendientes = item.error.codigo !== 'error_calculo'
+      conteos.fallido++
+    } else if (item.estado === 'no_ejecutado') {
+      if (item.duracion_segundos !== null || Object.hasOwn(item, 'error')) return false
+      debenQuedarPendientes = true
+      conteos.no_ejecutado++
+    } else return false
+  }
+
+  const resumen = value.resumen
+  if (Object.keys(resumen).length !== ESTADOS_ELEMENTO.length ||
+      !ESTADOS_ELEMENTO.every(estado => resumen[estado] === conteos[estado])) return false
+  if (value.estado === 'interrumpida') return value.contexto_verificado === false &&
+    esErrorPublico(value.interrupcion) && value.interrupcion.codigo !== 'error_calculo'
+  return value.contexto_verificado === true && value.interrupcion === null && !debenQuedarPendientes &&
+    (conteos.fallido === 0 ? value.estado === 'completa' : value.estado === 'parcial')
 }
 function esDisponibilidad(value: unknown, seleccion: Seleccion, corte: Corte, grupo: GrupoVariables): value is Disponibilidad {
   const columnas = grupo === 'clasico' ? VARIABLES_CLASICAS : VARIABLES_AMPLIADAS
@@ -224,14 +336,15 @@ function GraficoPronostico({ detalles, serie, pronostico }: {
 }
 
 class ErrorSolicitud extends Error {}
-async function leerRespuesta(response: Response): Promise<unknown> {
+async function leerRespuesta(response: Response, mensajePublico?: (codigo: string) => string | undefined): Promise<unknown> {
   let body: unknown
   try { body = await response.json() } catch {
     throw new ErrorSolicitud(`El servidor respondió con HTTP ${response.status}, pero no devolvió un JSON válido.`)
   }
   if (!response.ok) {
     const mensaje = registro(body) && registro(body.detail) && typeof body.detail.codigo === 'string' &&
-      typeof body.detail.mensaje === 'string' && body.detail.mensaje.trim() ? body.detail.mensaje : null
+      typeof body.detail.mensaje === 'string' && body.detail.mensaje.trim()
+      ? (mensajePublico ? mensajePublico(body.detail.codigo) : body.detail.mensaje) : null
     throw new ErrorSolicitud(mensaje ? `${mensaje} (HTTP ${response.status}).` : `La solicitud respondió con HTTP ${response.status}.`)
   }
   return body
@@ -327,6 +440,7 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   const [lista, setLista] = useState<EstadoLista>({ kind: 'loading' })
   const [detalle, setDetalle] = useState<EstadoDetalle>({ kind: 'idle' })
   const [generacion, setGeneracion] = useState<EstadoGeneracion>({ kind: 'idle' })
+  const [bateria, setBateria] = useState<EstadoBateria>({ kind: 'idle' })
   const solicitudLista = useRef<AbortController | null>(null)
   const solicitudDetalle = useRef<AbortController | null>(null)
   const vivo = useRef(true)
@@ -396,7 +510,8 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   async function generar(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!esTecnica(tecnica) || !esCorte(corte) || parametros === null || !event.currentTarget.reportValidity() ||
-        !iniciar({ conjuntoId, serie: seleccion.serie, tecnica, corte, grupo: esLineaBase ? null : grupo, parametros })) return
+        !iniciar({ tipo: 'individual', conjuntoId, serie: seleccion.serie, tecnica, corte,
+          grupo: esLineaBase ? null : grupo, parametros })) return
     const configuracion = !esLineaBase && (grupo === 'ampliado' || modificados) ? {
       tecnica, version_contrato: grupo === 'ampliado' ? 2 : 1, version_reglas: grupo === 'ampliado' ? 2 : 1,
       variables: grupo === 'ampliado' ? VARIABLES_AMPLIADAS : VARIABLES_CLASICAS,
@@ -430,6 +545,31 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
     }
   }
 
+  async function generarBateria() {
+    if (!activo || !esCorte(corte) || !idValido(conjuntoId) || !idValido(serieId) ||
+        !iniciar({ tipo: 'bateria', ...seleccion, corte })) return
+    setBateria({ kind: 'idle' })
+    try {
+      const response = await fetch(`/api/pronosticos/active/series/${serieId}/bateria`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conjunto_id: conjuntoId, fecha_corte: corte }),
+      })
+      const body = await leerRespuesta(response, mensajeBateria)
+      if (!vivo.current) return
+      if (response.status !== 200 || !esResultadoBateria(body, seleccion, corte)) {
+        throw new ErrorSolicitud('La respuesta no corresponde a la solicitud o contiene resultados inconsistentes.')
+      }
+      setBateria({ kind: 'success', data: body })
+    } catch (error) {
+      if (vivo.current) setBateria({ kind: 'error', message: 'No se pudo confirmar el resultado completo de la batería. ' +
+        mensajeError(error, 'Se perdió la conexión. El servidor puede seguir procesando la solicitud.') +
+        ' Consulte el listado antes de volver a ejecutar.' })
+    } finally {
+      if (vivo.current) await consultarLista()
+      finalizar(!vivo.current)
+    }
+  }
+
   return (
     <>
       <p className="forecast-series">Tienda <strong>{tienda}</strong> · Familia <strong>{familia}</strong></p>
@@ -449,7 +589,12 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
         <div>
           <label htmlFor="forecast-cutoff">Fecha de corte</label>
           <select id="forecast-cutoff" value={corte} disabled={pendiente}
-            onChange={event => { if (esCorte(event.target.value)) setCorte(event.target.value) }}>
+            onChange={event => {
+              if (!pendiente && esCorte(event.target.value)) {
+                setCorte(event.target.value)
+                setBateria({ kind: 'idle' })
+              }
+            }}>
             {CORTES.map((c, i) => <option key={c} value={c}>{c} · Validación {i + 1}</option>)}
           </select>
         </div>
@@ -547,6 +692,51 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
       {generacion.kind !== 'idle' && <p className={`forecast-message forecast-message--${generacion.kind}`}
         role={generacion.kind === 'error' ? 'alert' : 'status'}>{generacion.message}</p>}
 
+      <section className="forecast-results forecast-battery" aria-labelledby="forecast-battery-heading">
+        <h3 id="forecast-battery-heading">Batería de pronósticos</h3>
+        <p>Serie seleccionada · Corte {corte} · Horizonte de quince días.</p>
+        <p className="help-text">Usa cinco configuraciones fijas: línea base semanal, Random Forest clásico y ampliado,
+          e HistGradientBoosting clásico y ampliado. Los ajustes del formulario se aplican al pronóstico individual.</p>
+        <button type="button" disabled={pendiente || !activo || !idValido(conjuntoId) || !idValido(serieId)}
+          onClick={() => { void generarBateria() }}>Ejecutar batería de cinco configuraciones</button>
+        {bateria.kind === 'error' && <p className="forecast-message forecast-message--error" role="alert">{bateria.message}</p>}
+        {bateria.kind === 'success' && <>
+          <p className="forecast-message" role="status">{bateria.data.estado === 'completa'
+            ? 'Batería completa. Los cinco intentos terminaron correctamente.'
+            : bateria.data.estado === 'parcial'
+              ? 'Batería parcial. Hubo fallos de cálculo y se ejecutaron los cinco intentos.'
+              : 'Batería interrumpida durante la ejecución o la verificación de los resultados.'}
+            {bateria.data.interrupcion && ` ${mensajeBateria(bateria.data.interrupcion.codigo)}`}</p>
+          <dl className="forecast-availability-counts">
+            {ESTADOS_ELEMENTO.map(estado => <div key={estado}>
+              <dt>{ETIQUETAS_ELEMENTO[estado]}</dt><dd>{bateria.data.resumen[estado]}</dd>
+            </div>)}
+          </dl>
+          <div className="forecast-table-wrap" tabIndex={0} role="region" aria-label="Resultados de la batería">
+            <table>
+              <caption>Configuraciones ejecutadas y previstas para el corte {bateria.data.fecha_corte}</caption>
+              <thead><tr><th scope="col">Técnica</th><th scope="col">Grupo</th><th scope="col">Estado</th>
+                <th scope="col">Duración</th><th scope="col">Detalle</th></tr></thead>
+              <tbody>{bateria.data.resultados.map((item, indice) => {
+                const grupoItem = item.tecnica === 'estacional_semanal_recursiva' ? 'Sin grupo configurable' :
+                  item.version_contrato === 1 ? 'Clásico — 6 variables' : 'Ampliado — 7 variables'
+                return <tr key={indice}>
+                  <th scope="row">{nombreTecnica(item.tecnica)}</th><td>{grupoItem}</td>
+                  <td>{ETIQUETAS_ELEMENTO[item.estado]}
+                    {item.estado === 'fallido' && <p>{mensajeBateria(item.error.codigo)}</p>}</td>
+                  <td>{item.duracion_segundos === null ? '—' : `${presentarVenta(item.duracion_segundos)} s`}</td>
+                  <td>{(item.estado === 'creado' || item.estado === 'reutilizado') && <button type="button"
+                    disabled={detalle.kind === 'loading' && detalle.id === item.pronostico_id}
+                    aria-label={`Ver detalle de ${nombreTecnica(item.tecnica)}, ${grupoItem}`}
+                    onClick={() => { void consultarDetalle({ id: item.pronostico_id, experimento_id: item.experimento_id,
+                      tecnica: item.tecnica, fecha_corte: corte }) }}>Ver detalle</button>}</td>
+                </tr>
+              })}</tbody>
+            </table>
+          </div>
+        </>}
+      </section>
+
       <section className="forecast-results forecast-availability" aria-labelledby="forecast-availability-heading">
         <h3 id="forecast-availability-heading">Disponibilidad de filas de entrenamiento</h3>
         {esLineaBase ? <p>Este análisis de variables predictoras no aplica a la línea base semanal.</p>
@@ -630,12 +820,17 @@ function PronosticosVentas({ seleccion, activo }: Props) {
   return <section className="forecast-card" aria-labelledby="forecast-heading">
     <h2 id="forecast-heading">Pronósticos de demanda</h2>
     {generando !== null && <div className="forecast-message" role="status">
-      <p>Generando pronóstico. El entrenamiento puede tardar algunos segundos.</p>
+      <p>{generando.tipo === 'bateria' ? 'Ejecutando batería. El entrenamiento puede continuar hasta recibir la respuesta del servidor.'
+        : 'Generando pronóstico. El entrenamiento puede tardar algunos segundos.'}</p>
       <p>Solicitud para conjunto {generando.conjuntoId} · tienda {generando.serie.store_nbr} · {generando.serie.family}.</p>
-      <p>{nombreTecnica(generando.tecnica)} · Corte {generando.corte} · {generando.grupo === null
-        ? 'Sin grupo configurable' : generando.grupo === 'ampliado' ? 'Ampliado — 7 variables' : 'Clásico — 6 variables'}.</p>
-      {generando.grupo !== null && <p>{Object.keys(generando.parametros).length === 0 ? 'Hiperparámetros predeterminados.'
-        : `Parámetros solicitados: ${Object.entries(generando.parametros).map(([nombre, valor]) => `${nombre}=${valor}`).join(', ')}.`}</p>}
+      {generando.tipo === 'bateria' ? <>
+        <p>Corte {generando.corte}.</p><progress aria-label="Esperando la respuesta de la batería" />
+      </> : <>
+        <p>{nombreTecnica(generando.tecnica)} · Corte {generando.corte} · {generando.grupo === null
+          ? 'Sin grupo configurable' : generando.grupo === 'ampliado' ? 'Ampliado — 7 variables' : 'Clásico — 6 variables'}.</p>
+        {generando.grupo !== null && <p>{Object.keys(generando.parametros).length === 0 ? 'Hiperparámetros predeterminados.'
+          : `Parámetros solicitados: ${Object.entries(generando.parametros).map(([nombre, valor]) => `${nombre}=${valor}`).join(', ')}.`}</p>}
+      </>}
     </div>}
     {seleccion === null
       ? <p role="status">Seleccione una tienda y una familia válidas para consultar o generar pronósticos.</p>
