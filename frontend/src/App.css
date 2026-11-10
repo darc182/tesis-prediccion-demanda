@@ -531,6 +531,13 @@
 .forecast-table-wrap td { min-width: 100px; }
 .forecast-table-wrap td:last-child { white-space: nowrap; }
 .forecast-explanation { margin-top: 8px; }
+.forecast-availability { padding: 16px; border: 1px solid var(--border); border-radius: 8px; min-width: 0; overflow-wrap: anywhere; }
+.forecast-availability-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 16px; margin: 20px 0; }
+.forecast-availability-counts div { min-width: 0; }
+.forecast-availability-counts dt { font-size: 0.9rem; }
+.forecast-availability-counts dd { margin: 6px 0 0; color: var(--text-h); font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.forecast-availability .forecast-table-wrap th, .forecast-availability .forecast-table-wrap td { min-width: 0; white-space: normal; }
+.forecast-availability code { overflow-wrap: anywhere; }
 
 .forecast-chart {
   margin: 24px 0;

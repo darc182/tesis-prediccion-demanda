@@ -69,6 +69,14 @@ type EstadoLista = { kind: 'loading' } | { kind: 'error'; message: string } | { 
 type EstadoDetalle = { kind: 'idle' } | { kind: 'loading'; id: number } |
   { kind: 'error'; message: string } | { kind: 'success'; data: RespuestaDetalle }
 type EstadoGeneracion = { kind: 'idle' } | { kind: 'success' | 'error'; message: string }
+type Disponibilidad = {
+  conjunto_id: number; serie: SerieTemporal; fecha_corte: Corte; grupo: GrupoVariables
+  version_contrato: number; version_reglas: number; variables: string[]
+  observaciones_historicas: number; filas_aptas: number; filas_descartadas: number
+  descartes_por_variable: Record<string, number>
+}
+type EstadoDisponibilidad = { kind: 'idle' } | { kind: 'loading' } |
+  { kind: 'error'; message: string } | { kind: 'success'; data: Disponibilidad }
 const DIA = 86_400_000
 // Formato de presentación; no se redondean ni reemplazan valores en el estado.
 const formatoVentas = new Intl.NumberFormat('es-EC', { maximumFractionDigits: 3 })
@@ -105,6 +113,31 @@ function mismaSeleccion(value: unknown, seleccion: Seleccion): boolean {
   if (!registro(value) || !registro(value.serie)) return false
   return value.conjunto_id === seleccion.conjuntoId && value.serie.id === seleccion.serie.id &&
     value.serie.store_nbr === seleccion.serie.store_nbr && value.serie.family === seleccion.serie.family
+}
+function conteoValido(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+function esDisponibilidad(value: unknown, seleccion: Seleccion, corte: Corte, grupo: GrupoVariables): value is Disponibilidad {
+  const columnas = grupo === 'clasico' ? VARIABLES_CLASICAS : VARIABLES_AMPLIADAS
+  const version = grupo === 'clasico' ? 1 : 2
+  if (!registro(value) || !mismaSeleccion(value, seleccion) || value.fecha_corte !== corte || value.grupo !== grupo ||
+      value.version_contrato !== version || value.version_reglas !== version ||
+      !Array.isArray(value.variables) || value.variables.length !== columnas.length ||
+      !value.variables.every((nombre, indice) => nombre === columnas[indice]) ||
+      !conteoValido(value.observaciones_historicas) || !conteoValido(value.filas_aptas) ||
+      !conteoValido(value.filas_descartadas) ||
+      !Number.isSafeInteger(value.filas_aptas + value.filas_descartadas) ||
+      value.filas_aptas + value.filas_descartadas !== value.observaciones_historicas ||
+      !registro(value.descartes_por_variable)) return false
+  const descartes = value.descartes_por_variable
+  const filasDescartadas = value.filas_descartadas
+  const motivos = Object.values(descartes)
+  if (motivos.length !== columnas.length || !columnas.every(nombre => Object.hasOwn(descartes, nombre)) ||
+      !motivos.every(conteoValido)) return false
+  // Cada motivo afecta a filas descartadas; el calendario siempre está disponible.
+  // La suma solo valida una cota de coherencia: nunca sustituye el total de la API.
+  return motivos.every(n => n <= filasDescartadas) && descartes.dia_semana === 0 && descartes.mes === 0 &&
+    motivos.reduce((suma, n) => suma + n, 0) >= filasDescartadas
 }
 function esMetadato(value: unknown): value is Metadatos {
   if (!registro(value)) return false
@@ -205,6 +238,74 @@ async function leerRespuesta(response: Response): Promise<unknown> {
 }
 function mensajeError(error: unknown, alternativa: string): string {
   return error instanceof ErrorSolicitud ? error.message : alternativa
+}
+
+function ConsultaDisponibilidad({ seleccion, corte, grupo, pendiente }: {
+  seleccion: Seleccion; corte: Corte; grupo: GrupoVariables; pendiente: boolean
+}) {
+  const [estado, setEstado] = useState<EstadoDisponibilidad>({ kind: 'idle' })
+  const solicitud = useRef<AbortController | null>(null)
+  useEffect(() => () => {
+    solicitud.current?.abort()
+    solicitud.current = null
+  }, [])
+
+  async function consultar() {
+    // La referencia bloquea dobles clics incluso antes del siguiente render.
+    if (pendiente || solicitud.current !== null) return
+    const controller = new AbortController()
+    solicitud.current = controller
+    setEstado({ kind: 'loading' })
+    const vigente = () => solicitud.current === controller && !controller.signal.aborted
+    try {
+      const params = new URLSearchParams({ fecha_corte: corte, grupo })
+      const response = await fetch(`/api/pronosticos/active/series/${seleccion.serie.id}/filas-entrenamiento?${params}`, {
+        signal: controller.signal, cache: 'no-store',
+      })
+      const body = await leerRespuesta(response)
+      if (!vigente()) return
+      if (response.status !== 200 || !esDisponibilidad(body, seleccion, corte, grupo)) throw new ErrorSolicitud(
+        'La disponibilidad recibida no corresponde a la selección o contiene conteos inconsistentes.')
+      setEstado({ kind: 'success', data: body })
+    } catch (error) {
+      if (vigente()) setEstado({ kind: 'error', message: mensajeError(error,
+        'No se pudo conectar para consultar la disponibilidad de filas de entrenamiento.') })
+    } finally {
+      if (solicitud.current === controller) solicitud.current = null
+    }
+  }
+
+  return <div aria-busy={estado.kind === 'loading'}>
+    <p>Grupo {grupo === 'clasico' ? 'clásico — 6 variables' : 'ampliado — 7 variables'} · Corte {corte}.</p>
+    <button id="forecast-availability-query" type="button" disabled={pendiente || estado.kind === 'loading'}
+      onClick={() => { void consultar() }}>Consultar disponibilidad</button>
+    {estado.kind === 'idle' && <p role="status">Consulte las filas disponibles para la serie, el corte y el grupo seleccionados.</p>}
+    {estado.kind === 'loading' && <p role="status">Consultando disponibilidad de filas de entrenamiento…</p>}
+    {estado.kind === 'error' && <p className="forecast-message forecast-message--error" role="alert">{estado.message}</p>}
+    {estado.kind === 'success' && <>
+      <p role="status">Disponibilidad consultada para el grupo {estado.data.grupo === 'clasico' ? 'clásico' : 'ampliado'} y corte {estado.data.fecha_corte}.</p>
+      <dl className="forecast-availability-counts">
+        <div><dt>Observaciones históricas registradas hasta el corte</dt><dd>{estado.data.observaciones_historicas}</dd></div>
+        <div><dt>Filas aptas para preparar ejemplos de entrenamiento</dt><dd>{estado.data.filas_aptas}</dd></div>
+        <div><dt>Filas descartadas por información temporal insuficiente</dt><dd>{estado.data.filas_descartadas}</dd></div>
+      </dl>
+      {estado.data.filas_aptas === 0 && <p className="forecast-message" role="status">
+        No hay filas aptas para preparar ejemplos de entrenamiento con esta selección. Estos datos no permiten entrenar el regresor.
+      </p>}
+      <div className="forecast-table-wrap" tabIndex={0} role="region" aria-label="Descartes por variable predictora">
+        <table>
+          <caption>Motivos de descarte por variable predictora</caption>
+          <thead><tr><th scope="col">Variable predictora</th><th scope="col">Filas</th></tr></thead>
+          <tbody>{estado.data.variables.map(nombre => <tr key={nombre}>
+            <th scope="row"><code>{nombre}</code></th><td>{estado.data.descartes_por_variable[nombre]}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+    </>}
+    <p className="help-text">Una misma fila puede tener varios motivos de descarte; sus conteos pueden solaparse y no se suman para obtener el total descartado.
+      Las fechas sin registro no cuentan como observaciones descartadas. Las ventas cero observadas sí son observaciones.</p>
+    <p className="help-text">Las filas aptas indican disponibilidad de variables; no demuestran que el historial sea estadísticamente suficiente.</p>
+  </div>
 }
 
 type PanelProps = {
@@ -445,6 +546,14 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
       </form>
       {generacion.kind !== 'idle' && <p className={`forecast-message forecast-message--${generacion.kind}`}
         role={generacion.kind === 'error' ? 'alert' : 'status'}>{generacion.message}</p>}
+
+      <section className="forecast-results forecast-availability" aria-labelledby="forecast-availability-heading">
+        <h3 id="forecast-availability-heading">Disponibilidad de filas de entrenamiento</h3>
+        {esLineaBase ? <p>Este análisis de variables predictoras no aplica a la línea base semanal.</p>
+          : activo && <ConsultaDisponibilidad
+            key={JSON.stringify([conjuntoId, serieId, tienda, familia, corte, grupo])}
+            seleccion={seleccion} corte={corte} grupo={grupo} pendiente={pendiente} />}
+      </section>
 
       <section className="forecast-results" aria-labelledby="forecast-list-heading">
         <div className="forecast-list-header">
