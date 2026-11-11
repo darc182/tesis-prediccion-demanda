@@ -69,6 +69,8 @@ type RespuestaDetalle = { conjunto_id: number; serie: SerieTemporal; pronostico:
 type EstadoLista = { kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'success'; filas: Metadatos[] }
 type EstadoDetalle = { kind: 'idle' } | { kind: 'loading'; id: number } |
   { kind: 'error'; message: string } | { kind: 'success'; data: RespuestaDetalle }
+type EstadoComparacion = { kind: 'idle' } | { kind: 'loading' } |
+  { kind: 'error'; message: string } | { kind: 'success'; datos: RespuestaDetalle[] }
 type ParametroGuardado = number | string | boolean | null
 type ConfiguracionGuardada = {
   es_predeterminada: boolean
@@ -431,6 +433,82 @@ function GraficoPronostico({ detalles, serie, pronostico }: {
   </figure>
 }
 
+function GraficoComparacion({ datos }: { datos: RespuestaDetalle[] }) {
+  const id = useId()
+  const ancho = 1100
+  const alto = 420
+  const izquierda = 110
+  const derecha = 35
+  const arriba = 25
+  const abajo = 125
+  const maximoReal = datos.reduce((maximo, dato) =>
+    dato.detalles.reduce((valor, fila) => Math.max(valor, fila.venta_estimada), maximo), 0)
+  const maximo = maximoReal > 0 ? maximoReal : 1
+  const x = (paso: number) => izquierda + (paso - 1) / 14 * (ancho - izquierda - derecha)
+  const y = (valor: number) => arriba + (1 - valor / maximo) * (alto - arriba - abajo)
+  const marcas = [...new Set([0, 0.25, 0.5, 0.75, 1].map(fraccion => maximo * fraccion))]
+  const trazos = ['', '9 5', '2 5']
+  const nombresTrazo = ['Continuo', 'Guiones', 'Puntos']
+
+  return <>
+    <figure className="forecast-chart">
+      <figcaption className="forecast-chart-caption">
+        <strong>Pronósticos almacenados superpuestos</strong>
+        <span>Tienda {datos[0].serie.store_nbr} · {datos[0].serie.family} · Corte {datos[0].pronostico.fecha_corte}</span>
+      </figcaption>
+      <ul className="forecast-comparison-legend" aria-label="Leyenda de pronósticos comparados">
+        {datos.map((dato, indice) => <li key={dato.pronostico.id}>
+          <svg viewBox="0 0 50 12" aria-hidden="true"><line x1="0" x2="50" y1="6" y2="6"
+            className={`forecast-comparison-line forecast-comparison-line--${indice}`} strokeDasharray={trazos[indice]} /></svg>
+          <span>{nombreTecnica(dato.pronostico.tecnica)} · Pronóstico {dato.pronostico.id} · Experimento {dato.pronostico.experimento_id}
+            {' · '}{nombresTrazo[indice]}</span>
+        </li>)}
+      </ul>
+      <div className="forecast-chart-scroll forecast-comparison-scroll" tabIndex={0} role="region"
+        aria-label="Gráfico conjunto de quince fechas, desplazable horizontalmente">
+        <svg viewBox={`0 0 ${ancho} ${alto}`} role="img" aria-labelledby={`${id}-title ${id}-desc`}>
+          <title id={`${id}-title`}>Comparación visual de {datos.length} pronósticos almacenados</title>
+          <desc id={`${id}-desc`}>Quince fechas objetivo y eje vertical compartido desde cero. Cada pronóstico se identifica
+            mediante su técnica, ID y trazo en la leyenda. La tabla inferior presenta las mismas estimaciones.</desc>
+          {marcas.map(valor => <g key={valor}>
+            <line x1={izquierda} x2={ancho - derecha} y1={y(valor)} y2={y(valor)} className="forecast-chart-grid" />
+            <text x={izquierda - 10} y={y(valor) + 4} textAnchor="end" className="forecast-chart-label">{presentarVenta(valor)}</text>
+          </g>)}
+          <line x1={izquierda} x2={izquierda} y1={arriba} y2={alto - abajo} className="forecast-chart-axis" />
+          <line x1={izquierda} x2={ancho - derecha} y1={alto - abajo} y2={alto - abajo} className="forecast-chart-axis" />
+          {datos[0].detalles.map(fila => <text key={fila.paso}
+            transform={`translate(${x(fila.paso)} ${alto - abajo + 20}) rotate(-45)`} textAnchor="end"
+            className="forecast-chart-label">{fila.fecha_objetivo}</text>)}
+          <text x={izquierda + (ancho - izquierda - derecha) / 2} y={alto - 8} textAnchor="middle"
+            className="forecast-chart-axis-title">Fecha objetivo</text>
+          <text transform={`translate(18 ${arriba + (alto - arriba - abajo) / 2}) rotate(-90)`} textAnchor="middle"
+            className="forecast-chart-axis-title">Ventas estimadas</text>
+          {datos.map((dato, indice) => <polyline key={dato.pronostico.id}
+            points={dato.detalles.map(fila => `${x(fila.paso)},${y(fila.venta_estimada)}`).join(' ')}
+            className={`forecast-comparison-line forecast-comparison-line--${indice}`} strokeDasharray={trazos[indice]}>
+            <title>{nombreTecnica(dato.pronostico.tecnica)} · Pronóstico {dato.pronostico.id}</title>
+          </polyline>)}
+        </svg>
+      </div>
+    </figure>
+    <div className="forecast-table-wrap" tabIndex={0} role="region" aria-label="Quince fechas de los pronósticos comparados">
+      <table>
+        <caption>Estimaciones por fecha objetivo</caption>
+        <thead><tr><th scope="col">Fecha objetivo</th>{datos.map(dato => <th scope="col" key={dato.pronostico.id}>
+          {nombreTecnica(dato.pronostico.tecnica)}<br />Pronóstico {dato.pronostico.id}
+        </th>)}</tr></thead>
+        <tbody>{datos[0].detalles.map((fila, indice) => <tr key={fila.paso}>
+          <th scope="row">{fila.fecha_objetivo}</th>{datos.map(dato => <td key={dato.pronostico.id}>
+            {presentarVenta(dato.detalles[indice].venta_estimada)}
+          </td>)}
+        </tr>)}</tbody>
+      </table>
+    </div>
+    <p className="help-text">Las curvas son estimaciones. La comparación visual, por sí sola, no permite establecer
+      cuál técnica es más precisa.</p>
+  </>
+}
+
 class ErrorSolicitud extends Error {}
 async function leerRespuesta(response: Response, mensajePublico?: (codigo: string) => string | undefined): Promise<unknown> {
   let body: unknown
@@ -564,12 +642,15 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   const filasFiltradas = lista.kind === 'success' ? lista.filas.filter(p =>
     (!filtroTecnica || p.tecnica === filtroTecnica) && (!filtroCorte || p.fecha_corte === filtroCorte)) : []
   const [detalle, setDetalle] = useState<EstadoDetalle>({ kind: 'idle' })
+  const [seleccionComparacion, setSeleccionComparacion] = useState<Metadatos[]>([])
+  const [comparacion, setComparacion] = useState<EstadoComparacion>({ kind: 'idle' })
   const [configuracionGuardada, setConfiguracionGuardada] = useState<EstadoConfiguracion>({ kind: 'idle' })
   const [generacion, setGeneracion] = useState<EstadoGeneracion>({ kind: 'idle' })
   const [bateria, setBateria] = useState<EstadoBateria>({ kind: 'idle' })
   const solicitudLista = useRef<AbortController | null>(null)
   const solicitudDetalle = useRef<AbortController | null>(null)
   const solicitudConfiguracion = useRef<AbortController | null>(null)
+  const solicitudComparacion = useRef<AbortController | null>(null)
   const vivo = useRef(true)
   const ultimaRevision = useRef(-1)
 
@@ -581,10 +662,18 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
       solicitudLista.current?.abort()
       solicitudDetalle.current?.abort()
       solicitudConfiguracion.current?.abort()
+      solicitudComparacion.current?.abort()
     }
   }, [])
 
+  const invalidarComparacion = useCallback(() => {
+    solicitudComparacion.current?.abort()
+    solicitudComparacion.current = null
+    setComparacion({ kind: 'idle' })
+  }, [])
+
   const consultarLista = useCallback(async () => {
+    invalidarComparacion()
     solicitudLista.current?.abort()
     const controller = new AbortController()
     solicitudLista.current = controller
@@ -599,14 +688,20 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
           new Set(body.pronosticos.map(p => p.id)).size !== body.pronosticos.length) {
         throw new ErrorSolicitud('El listado recibido no corresponde a la serie y conjunto seleccionados o contiene datos inválidos.')
       }
-      setLista({ kind: 'success', filas: body.pronosticos })
+      const filas = body.pronosticos
+      setSeleccionComparacion(anterior => anterior.flatMap(p => {
+        const vigente = filas.find(fila => fila.id === p.id && fila.experimento_id === p.experimento_id &&
+          fila.tecnica === p.tecnica && fila.fecha_corte === p.fecha_corte)
+        return vigente ? [vigente] : []
+      }))
+      setLista({ kind: 'success', filas })
     } catch (error) {
       if (vivo.current && !controller.signal.aborted) setLista({ kind: 'error', message:
         mensajeError(error, 'No se pudo conectar para consultar los pronósticos almacenados.') })
     } finally {
       if (solicitudLista.current === controller) solicitudLista.current = null
     }
-  }, [conjuntoId, serieId, tienda, familia])
+  }, [conjuntoId, serieId, tienda, familia, invalidarComparacion])
 
   useEffect(() => {
     if (activo && ultimaRevision.current !== revision) {
@@ -663,6 +758,71 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
         'No se pudo conectar para consultar la configuración guardada.') })
     } finally {
       if (solicitudConfiguracion.current === controller) solicitudConfiguracion.current = null
+    }
+  }
+
+  function motivoComparacion(p: Metadatos, elegidos = seleccionComparacion): string | null {
+    if (elegidos.some(item => item.id === p.id)) return null
+    if (elegidos.length >= 3) return 'Quite un pronóstico antes de añadir un cuarto.'
+    if (elegidos.length && elegidos[0].fecha_corte !== p.fecha_corte) {
+      return `Seleccione pronósticos del corte ${elegidos[0].fecha_corte}.`
+    }
+    if (elegidos.some(item => item.experimento_id === p.experimento_id)) {
+      return 'Seleccione un experimento diferente.'
+    }
+    return null
+  }
+
+  function cambiarSeleccionComparacion(p: Metadatos, agregar: boolean) {
+    if (agregar && (motivoComparacion(p) || seleccionComparacion.some(item => item.id === p.id))) return
+    invalidarComparacion()
+    setSeleccionComparacion(anterior => {
+      if (!agregar) return anterior.filter(item => item.id !== p.id)
+      return motivoComparacion(p, anterior) || anterior.some(item => item.id === p.id) ? anterior : [...anterior, p]
+    })
+  }
+
+  function filtrarSeleccionComparacion(tecnicaHistorial: Tecnica | '', corteHistorial: Corte | '') {
+    invalidarComparacion()
+    setSeleccionComparacion(anterior => anterior.filter(p =>
+      (!tecnicaHistorial || p.tecnica === tecnicaHistorial) && (!corteHistorial || p.fecha_corte === corteHistorial)))
+  }
+
+  async function consultarComparacion() {
+    if (lista.kind !== 'success' || seleccionComparacion.length < 2 || seleccionComparacion.length > 3 ||
+        solicitudComparacion.current !== null) return
+    const esperados = [...seleccionComparacion]
+    const controller = new AbortController()
+    solicitudComparacion.current = controller
+    setComparacion({ kind: 'loading' })
+    const vigente = () => vivo.current && solicitudComparacion.current === controller && !controller.signal.aborted
+    try {
+      const datos = await Promise.all(esperados.map(async esperado => {
+        const response = await fetch(`/api/pronosticos/active/${esperado.id}`, {
+          signal: controller.signal, cache: 'no-store',
+        })
+        const body = await leerRespuesta(response, codigo => codigo === 'error_interno'
+          ? 'Ocurrió un error interno al consultar el pronóstico.'
+          : Object.hasOwn(ERRORES_CONFIGURACION, codigo) ? ERRORES_CONFIGURACION[codigo] : undefined)
+        if (response.status !== 200 || !esDetalle(body, seleccion, esperado)) {
+          throw new ErrorSolicitud('Los datos recibidos no corresponden a los pronósticos seleccionados o contienen estimaciones inválidas.')
+        }
+        return body
+      }))
+      if (!vigente()) return
+      if (!datos.every(dato => dato.pronostico.fecha_corte === datos[0].pronostico.fecha_corte &&
+          dato.detalles.every((fila, indice) => fila.fecha_objetivo === datos[0].detalles[indice].fecha_objetivo))) {
+        throw new ErrorSolicitud('Los pronósticos recibidos tienen cortes o fechas objetivo diferentes.')
+      }
+      setComparacion({ kind: 'success', datos })
+    } catch (error) {
+      if (vigente()) {
+        controller.abort()
+        setComparacion({ kind: 'error', message: 'No se puede confirmar la comparación completa. ' +
+          mensajeError(error, 'No se pudo conectar para consultar los pronósticos. Puede intentarlo nuevamente.') })
+      }
+    } finally {
+      if (solicitudComparacion.current === controller) solicitudComparacion.current = null
     }
   }
 
@@ -917,6 +1077,7 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
               if (valor === '' || esTecnica(valor)) {
                 setFiltroTecnica(valor)
                 cerrarConfiguracion()
+                filtrarSeleccionComparacion(valor, filtroCorte)
               }
             }}>
               <option value="">Todas las técnicas</option>
@@ -930,6 +1091,7 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
               if (valor === '' || esCorte(valor)) {
                 setFiltroCorte(valor)
                 cerrarConfiguracion()
+                filtrarSeleccionComparacion(filtroTecnica, valor)
               }
             }}>
               <option value="">Todos los cortes</option>
@@ -946,7 +1108,7 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
             <table>
               <caption>Resultados disponibles de la serie seleccionada</caption>
               <thead><tr><th scope="col">Técnica</th><th scope="col">Corte</th><th scope="col">Periodo (15 días)</th>
-                <th scope="col">Generación</th><th scope="col">Acción</th></tr></thead>
+                <th scope="col">Generación</th><th scope="col">Acción</th><th scope="col">Comparación visual</th></tr></thead>
               <tbody>{filasFiltradas.map(p => <tr key={p.id}>
                 <td>{nombreTecnica(p.tecnica)}<br /><small>Pronóstico {p.id} · Experimento {p.experimento_id}</small></td><td>{p.fecha_corte}</td>
                 <td>{fechaFutura(p.fecha_corte, 1)} a {fechaFutura(p.fecha_corte, 15)}</td>
@@ -957,6 +1119,14 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
                   <button type="button" disabled={configuracionGuardada.kind === 'loading' && configuracionGuardada.id === p.id}
                     aria-label={`Ver configuración del pronóstico ${p.id}`}
                     onClick={() => { void consultarConfiguracion(p) }}>Ver configuración</button></td>
+                <td className="forecast-comparison-choice">
+                  <label><input type="checkbox" checked={seleccionComparacion.some(item => item.id === p.id)}
+                    disabled={motivoComparacion(p) !== null}
+                    aria-label={`Comparar pronóstico ${p.id} de ${nombreTecnica(p.tecnica)} con corte ${p.fecha_corte}`}
+                    aria-describedby={motivoComparacion(p) ? `forecast-compare-reason-${p.id}` : undefined}
+                    onChange={event => cambiarSeleccionComparacion(p, event.target.checked)} /> Seleccionar</label>
+                  {motivoComparacion(p) && <p id={`forecast-compare-reason-${p.id}`} className="help-text">{motivoComparacion(p)}</p>}
+                </td>
               </tr>)}</tbody>
             </table>
           </div>)}
@@ -965,6 +1135,17 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
           Pronóstico {configuracionGuardada.id} · {configuracionGuardada.message}</p>}
         {configuracionGuardada.kind === 'success' && <ConfiguracionPronostico
           pronostico={configuracionGuardada.pronostico} data={configuracionGuardada.data} />}
+      </section>
+      <section className="forecast-results" aria-labelledby="forecast-comparison-heading" aria-busy={comparacion.kind === 'loading'}>
+        <h3 id="forecast-comparison-heading">Comparación visual de pronósticos almacenados</h3>
+        <p>Seleccione dos o tres pronósticos de experimentos diferentes y del mismo corte en el historial.</p>
+        <p role="status">Seleccionados {seleccionComparacion.length} de 3
+          {seleccionComparacion.length > 0 && ` · Corte ${seleccionComparacion[0].fecha_corte} · Pronósticos ${seleccionComparacion.map(p => p.id).join(', ')}`}.</p>
+        <button type="button" disabled={lista.kind !== 'success' || seleccionComparacion.length < 2 || comparacion.kind === 'loading'}
+          onClick={() => { void consultarComparacion() }}>Comparar pronósticos seleccionados</button>
+        {comparacion.kind === 'loading' && <p role="status">Consultando todos los pronósticos seleccionados…</p>}
+        {comparacion.kind === 'error' && <p role="alert" className="forecast-message forecast-message--error">{comparacion.message}</p>}
+        {comparacion.kind === 'success' && <GraficoComparacion datos={comparacion.datos} />}
       </section>
       {detalle.kind === 'loading' && <p className="forecast-message" role="status">Consultando detalle del pronóstico…</p>}
       {detalle.kind === 'error' && <p className="forecast-message forecast-message--error" role="alert">{detalle.message}</p>}

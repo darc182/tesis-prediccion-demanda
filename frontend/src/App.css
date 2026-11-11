@@ -598,6 +598,17 @@
   stroke-width: 2;
 }
 
+.forecast-comparison-scroll svg { min-width: 1100px; }
+.forecast-comparison-legend { list-style: none; padding: 0; display: grid; gap: 8px; }
+.forecast-comparison-legend li { display: flex; align-items: center; gap: 12px; }
+.forecast-comparison-legend svg { width: 50px; height: 12px; flex-shrink: 0; }
+.forecast-comparison-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+.forecast-comparison-line--1 { stroke: var(--text-h); }
+.forecast-comparison-line--2 { stroke: #b36b16; }
+.forecast-table-wrap td.forecast-comparison-choice { white-space: normal; min-width: 160px; }
+.forecast-comparison-choice label { display: flex; align-items: center; gap: 8px; }
+.forecast-comparison-choice input { flex-shrink: 0; }
+
 .forecast-chart-point {
   fill: var(--accent);
   stroke: var(--bg);
