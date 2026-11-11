@@ -186,6 +186,16 @@ const ERRORES_BATERIA: Readonly<Record<string, string>> = {
   error_persistencia: 'No se pudo completar el registro de este pronóstico.',
   error_interno: 'No se pudo completar la ejecución de la batería.',
 }
+const ERRORES_PRONOSTICOS: Readonly<Record<string, string>> = {
+  ...ERRORES_BATERIA,
+  ...ERRORES_CONFIGURACION,
+  grupo_invalido: 'El grupo de variables debe ser clásico o ampliado.',
+  entrada_filas_invalida: 'Indique únicamente la fecha de corte y el grupo de variables.',
+  entrada_invalida: 'Revise la serie, la técnica y la fecha de corte de la solicitud.',
+  configuracion_invalida: 'La configuración solicitada no es válida para la técnica y el grupo seleccionados.',
+  tecnica_invalida: 'La técnica solicitada no está disponible.',
+  error_interno: 'Ocurrió un error interno al procesar la solicitud.',
+}
 type Disponibilidad = {
   conjunto_id: number; serie: SerieTemporal; fecha_corte: Corte; grupo: GrupoVariables
   version_contrato: number; version_reglas: number; variables: string[]
@@ -236,6 +246,9 @@ function conteoValido(value: unknown): value is number {
 }
 function mensajeBateria(codigo: string): string | undefined {
   return Object.hasOwn(ERRORES_BATERIA, codigo) ? ERRORES_BATERIA[codigo] : undefined
+}
+function mensajePronosticos(codigo: string): string | undefined {
+  return Object.hasOwn(ERRORES_PRONOSTICOS, codigo) ? ERRORES_PRONOSTICOS[codigo] : undefined
 }
 function esErrorPublico(value: unknown): value is ErrorPublico {
   return registro(value) && typeof value.codigo === 'string' && typeof value.mensaje === 'string' &&
@@ -516,9 +529,8 @@ async function leerRespuesta(response: Response, mensajePublico?: (codigo: strin
     throw new ErrorSolicitud(`El servidor respondió con HTTP ${response.status}, pero no devolvió un JSON válido.`)
   }
   if (!response.ok) {
-    const mensaje = registro(body) && registro(body.detail) && typeof body.detail.codigo === 'string' &&
-      typeof body.detail.mensaje === 'string' && body.detail.mensaje.trim()
-      ? (mensajePublico ? mensajePublico(body.detail.codigo) : body.detail.mensaje) : null
+    const mensaje = registro(body) && registro(body.detail) && typeof body.detail.codigo === 'string'
+      ? (mensajePublico ?? mensajePronosticos)(body.detail.codigo) : undefined
     throw new ErrorSolicitud(mensaje ? `${mensaje} (HTTP ${response.status}).` : `La solicitud respondió con HTTP ${response.status}.`)
   }
   return body
