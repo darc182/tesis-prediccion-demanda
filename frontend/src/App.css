@@ -523,6 +523,13 @@
 .forecast-results { margin-top: 28px; }
 .forecast-list-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
 .forecast-list-header h3 { margin: 0; }
+.forecast-history-actions button { display: block; }
+.forecast-history-actions button + button { margin-top: 8px; }
+.forecast-configuration { padding: 16px; border: 1px solid var(--border); border-radius: 8px; overflow-wrap: anywhere; }
+.forecast-configuration h4, .forecast-configuration h5 { margin: 0 0 12px; color: var(--text-h); font-size: 1rem; }
+.forecast-configuration-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 12px; margin: 16px 0; }
+.forecast-configuration-fields dt { font-size: 0.9rem; }
+.forecast-configuration-fields dd { margin: 4px 0 0; color: var(--text-h); }
 .forecast-table-wrap { max-width: 100%; overflow-x: auto; margin-top: 12px; }
 .forecast-table-wrap table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 .forecast-table-wrap caption { text-align: left; margin-bottom: 10px; color: var(--text-h); font-weight: 600; }
@@ -530,6 +537,7 @@
 .forecast-table-wrap th { color: var(--text-h); white-space: nowrap; }
 .forecast-table-wrap td { min-width: 100px; }
 .forecast-table-wrap td:last-child { white-space: nowrap; }
+.forecast-table-wrap td.forecast-history-actions { white-space: normal; }
 .forecast-explanation { margin-top: 8px; }
 .forecast-availability, .forecast-battery { padding: 16px; border: 1px solid var(--border); border-radius: 8px; min-width: 0; overflow-wrap: anywhere; }
 .forecast-availability-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 16px; margin: 20px 0; }

@@ -61,6 +61,7 @@ type Metadatos = {
   id: number; experimento_id: number; tecnica: Tecnica; fecha_corte: Corte
   tipo: 'validacion'; horizonte: number; fecha_generacion: string
   inicio_entrenamiento: string; fin_entrenamiento: string
+  duracion_segundos?: number | null
 }
 type Referencia = Pick<Metadatos, 'id' | 'experimento_id' | 'tecnica' | 'fecha_corte'>
 type Fila = { paso: number; fecha_objetivo: string; venta_estimada: number }
@@ -68,6 +69,78 @@ type RespuestaDetalle = { conjunto_id: number; serie: SerieTemporal; pronostico:
 type EstadoLista = { kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'success'; filas: Metadatos[] }
 type EstadoDetalle = { kind: 'idle' } | { kind: 'loading'; id: number } |
   { kind: 'error'; message: string } | { kind: 'success'; data: RespuestaDetalle }
+type ParametroGuardado = number | string | boolean | null
+type ConfiguracionGuardada = {
+  es_predeterminada: boolean
+  configuracion: {
+    tecnica: Tecnica; parametros: Record<string, ParametroGuardado>; variables: string[]
+    horizonte: 15; version_contrato: 1 | 2; version_reglas: 1 | 2
+  }
+}
+type EstadoConfiguracion = { kind: 'idle' } | { kind: 'loading'; id: number } |
+  { kind: 'error'; id: number; message: string } |
+  { kind: 'success'; pronostico: Metadatos; data: ConfiguracionGuardada }
+const esEnteroGuardado = (valor: unknown) => typeof valor === 'number' && Number.isSafeInteger(valor)
+const esRealGuardado = (valor: unknown) => typeof valor === 'number' && Number.isFinite(valor)
+const esBooleanoGuardado = (valor: unknown) => typeof valor === 'boolean'
+const esNuloGuardado = (valor: unknown) => valor === null
+const esEnteroONuloGuardado = (valor: unknown) => esNuloGuardado(valor) || esEnteroGuardado(valor)
+const esSemillaGuardada = (valor: unknown) => conteoValido(valor) && valor <= 0xffffffff
+
+// Tipos de los parámetros efectivos publicados por F2. El backend valida los valores y sus límites.
+const PARAMETROS_GUARDADOS: Record<Tecnica, Readonly<Record<string, (valor: unknown) => boolean>>> = {
+  estacional_semanal_recursiva: { periodo_estacional_dias: esEnteroGuardado },
+  random_forest: {
+    bootstrap: esBooleanoGuardado,
+    ccp_alpha: esRealGuardado,
+    criterion: valor => valor === 'squared_error',
+    max_depth: esEnteroONuloGuardado,
+    max_features: valor => esRealGuardado(valor) || valor === 'sqrt' || valor === 'log2',
+    max_leaf_nodes: esEnteroONuloGuardado,
+    max_samples: esNuloGuardado,
+    min_impurity_decrease: esRealGuardado,
+    min_samples_leaf: esEnteroGuardado,
+    min_samples_split: esEnteroGuardado,
+    min_weight_fraction_leaf: esRealGuardado,
+    monotonic_cst: esNuloGuardado,
+    n_estimators: esEnteroGuardado,
+    n_jobs: esEnteroGuardado,
+    oob_score: esBooleanoGuardado,
+    random_state: esSemillaGuardada,
+    verbose: esEnteroGuardado,
+    warm_start: esBooleanoGuardado,
+  },
+  hist_gradient_boosting: {
+    categorical_features: valor => valor === 'from_dtype',
+    early_stopping: esBooleanoGuardado,
+    interaction_cst: esNuloGuardado,
+    l2_regularization: esRealGuardado,
+    learning_rate: esRealGuardado,
+    loss: valor => valor === 'squared_error',
+    max_bins: esEnteroGuardado,
+    max_depth: esEnteroONuloGuardado,
+    max_features: esRealGuardado,
+    max_iter: esEnteroGuardado,
+    max_leaf_nodes: esEnteroGuardado,
+    min_samples_leaf: esEnteroGuardado,
+    monotonic_cst: esNuloGuardado,
+    n_iter_no_change: esEnteroGuardado,
+    quantile: esNuloGuardado,
+    random_state: esSemillaGuardada,
+    scoring: valor => valor === 'loss',
+    tol: esRealGuardado,
+    validation_fraction: esRealGuardado,
+    verbose: esEnteroGuardado,
+    warm_start: esBooleanoGuardado,
+  },
+}
+const ERRORES_CONFIGURACION: Readonly<Record<string, string>> = {
+  pronostico_inexistente: 'El pronóstico no existe en el conjunto activo.',
+  pronostico_corrupto: 'El pronóstico almacenado está incompleto o presenta datos inconsistentes.',
+  sin_conjunto_activo: 'No existe un conjunto activo para esta operación.',
+  base_no_disponible: 'La base de datos no está disponible o no tiene el esquema necesario.',
+  error_interno: 'Ocurrió un error interno al consultar la configuración.',
+}
 type EstadoGeneracion = { kind: 'idle' } | { kind: 'success' | 'error'; message: string }
 const ESTADOS_ELEMENTO = ['creado', 'reutilizado', 'fallido', 'no_ejecutado'] as const
 type EstadoElemento = typeof ESTADOS_ELEMENTO[number]
@@ -255,6 +328,7 @@ function esMetadato(value: unknown): value is Metadatos {
   if (!registro(value)) return false
   return idValido(value.id) && idValido(value.experimento_id) && esTecnica(value.tecnica) &&
     esCorte(value.fecha_corte) && value.tipo === 'validacion' && value.horizonte === 15 &&
+    (value.duracion_segundos == null || duracionValida(value.duracion_segundos)) &&
     typeof value.fecha_generacion === 'string' && Number.isFinite(Date.parse(value.fecha_generacion)) &&
     instanteFecha(value.inicio_entrenamiento) !== null && instanteFecha(value.fin_entrenamiento) !== null &&
     (value.inicio_entrenamiento as string) <= (value.fin_entrenamiento as string) &&
@@ -269,6 +343,28 @@ function esDetalle(value: unknown, seleccion: Seleccion, esperado: Referencia): 
   return value.detalles.every((fila: unknown, indice: number) => registro(fila) &&
     fila.paso === indice + 1 && fila.fecha_objetivo === fechaFutura(p.fecha_corte, indice + 1) &&
     typeof fila.venta_estimada === 'number' && Number.isFinite(fila.venta_estimada) && fila.venta_estimada >= 0)
+}
+function esConfiguracionGuardada(value: unknown, seleccion: Seleccion, esperado: Metadatos): value is ConfiguracionGuardada {
+  if (!registro(value) || !mismaSeleccion(value, seleccion) || value.pronostico_id !== esperado.id ||
+      value.experimento_id !== esperado.experimento_id || value.fecha_corte !== esperado.fecha_corte ||
+      typeof value.es_predeterminada !== 'boolean' || !registro(value.configuracion)) return false
+
+  const config = value.configuracion
+  const base = esperado.tecnica === 'estacional_semanal_recursiva'
+  const version = config.version_contrato
+  if (config.tecnica !== esperado.tecnica || config.horizonte !== esperado.horizonte ||
+      (version !== 1 && (version !== 2 || base)) || config.version_reglas !== version ||
+      !Array.isArray(config.variables) || !registro(config.parametros)) return false
+  const variables = base ? [] : version === 1 ? VARIABLES_CLASICAS : VARIABLES_AMPLIADAS
+  const columnas = config.variables
+  if (columnas.length !== variables.length || new Set(columnas).size !== variables.length ||
+      !variables.every(nombre => columnas.includes(nombre)) ||
+      (version === 2 && !columnas.every((nombre, i) => nombre === variables[i]))) return false
+
+  const parametros = config.parametros
+  const tipos = Object.entries(PARAMETROS_GUARDADOS[esperado.tecnica])
+  return Object.keys(parametros).length === tipos.length &&
+    tipos.every(([nombre, validar]) => Object.hasOwn(parametros, nombre) && validar(parametros[nombre]))
 }
 function nombreTecnica(tecnica: Tecnica): string {
   return TECNICAS.find(t => t.id === tecnica)?.nombre ?? tecnica
@@ -351,6 +447,31 @@ async function leerRespuesta(response: Response, mensajePublico?: (codigo: strin
 }
 function mensajeError(error: unknown, alternativa: string): string {
   return error instanceof ErrorSolicitud ? error.message : alternativa
+}
+
+function ConfiguracionPronostico({ pronostico, data }: { pronostico: Metadatos; data: ConfiguracionGuardada }) {
+  const config = data.configuracion
+  return <section className="forecast-results forecast-configuration" aria-labelledby="forecast-configuration-heading">
+    <h4 id="forecast-configuration-heading">Configuración del pronóstico {pronostico.id}</h4>
+    <p role="status">Experimento {pronostico.experimento_id} · {nombreTecnica(config.tecnica)} · Corte {pronostico.fecha_corte}</p>
+    <dl className="forecast-configuration-fields">
+      <div><dt>Configuración predeterminada</dt><dd>{data.es_predeterminada ? 'Sí' : 'No'}</dd></div>
+      <div><dt>Horizonte</dt><dd>{config.horizonte} días</dd></div>
+      <div><dt>Versión del contrato</dt><dd>{config.version_contrato}</dd></div>
+      <div><dt>Versión de reglas</dt><dd>{config.version_reglas}</dd></div>
+      <div><dt>Inicio de entrenamiento</dt><dd>{pronostico.inicio_entrenamiento}</dd></div>
+      <div><dt>Fin de entrenamiento</dt><dd>{pronostico.fin_entrenamiento}</dd></div>
+      <div><dt>Fecha de generación</dt><dd>{formatoGeneracion.format(new Date(pronostico.fecha_generacion))}</dd></div>
+      {pronostico.duracion_segundos != null && <div><dt>Duración</dt><dd>{presentarVenta(pronostico.duracion_segundos)} s</dd></div>}
+    </dl>
+    <p>Variables predictoras {config.variables.length ? <code>{config.variables.join(', ')}</code> : '· No aplica'}</p>
+    <h5>Parámetros efectivos</h5>
+    <dl className="forecast-configuration-fields">
+      {Object.entries(config.parametros).map(([nombre, valor]) => <div key={nombre}>
+        <dt>{nombre === 'random_state' && 'Semilla aleatoria '}<code>{nombre}</code></dt><dd><code>{String(valor)}</code></dd>
+      </div>)}
+    </dl>
+  </section>
 }
 
 function ConsultaDisponibilidad({ seleccion, corte, grupo, pendiente }: {
@@ -438,11 +559,17 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   const parametros = resolverParametros(tecnica, rf, hgb)
   const modificados = parametros !== null && Object.keys(parametros).length > 0
   const [lista, setLista] = useState<EstadoLista>({ kind: 'loading' })
+  const [filtroTecnica, setFiltroTecnica] = useState<Tecnica | ''>('')
+  const [filtroCorte, setFiltroCorte] = useState<Corte | ''>('')
+  const filasFiltradas = lista.kind === 'success' ? lista.filas.filter(p =>
+    (!filtroTecnica || p.tecnica === filtroTecnica) && (!filtroCorte || p.fecha_corte === filtroCorte)) : []
   const [detalle, setDetalle] = useState<EstadoDetalle>({ kind: 'idle' })
+  const [configuracionGuardada, setConfiguracionGuardada] = useState<EstadoConfiguracion>({ kind: 'idle' })
   const [generacion, setGeneracion] = useState<EstadoGeneracion>({ kind: 'idle' })
   const [bateria, setBateria] = useState<EstadoBateria>({ kind: 'idle' })
   const solicitudLista = useRef<AbortController | null>(null)
   const solicitudDetalle = useRef<AbortController | null>(null)
+  const solicitudConfiguracion = useRef<AbortController | null>(null)
   const vivo = useRef(true)
   const ultimaRevision = useRef(-1)
 
@@ -453,6 +580,7 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
       ultimaRevision.current = -1 // permite repetir el GET abortado por StrictMode
       solicitudLista.current?.abort()
       solicitudDetalle.current?.abort()
+      solicitudConfiguracion.current?.abort()
     }
   }, [])
 
@@ -504,6 +632,37 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
         mensajeError(error, 'No se pudo conectar para consultar el detalle del pronóstico.') })
     } finally {
       if (solicitudDetalle.current === controller) solicitudDetalle.current = null
+    }
+  }
+
+  function cerrarConfiguracion() {
+    solicitudConfiguracion.current?.abort()
+    solicitudConfiguracion.current = null
+    setConfiguracionGuardada({ kind: 'idle' })
+  }
+
+  async function consultarConfiguracion(esperado: Metadatos) {
+    solicitudConfiguracion.current?.abort()
+    const controller = new AbortController()
+    solicitudConfiguracion.current = controller
+    setConfiguracionGuardada({ kind: 'loading', id: esperado.id })
+    const vigente = () => vivo.current && solicitudConfiguracion.current === controller && !controller.signal.aborted
+    try {
+      const response = await fetch(`/api/pronosticos/active/${esperado.id}/configuracion`, {
+        signal: controller.signal, cache: 'no-store',
+      })
+      const body = await leerRespuesta(response, codigo =>
+        Object.hasOwn(ERRORES_CONFIGURACION, codigo) ? ERRORES_CONFIGURACION[codigo] : undefined)
+      if (!vigente()) return
+      if (response.status !== 200 || !esConfiguracionGuardada(body, seleccion, esperado)) {
+        throw new ErrorSolicitud('La configuración recibida no corresponde al pronóstico seleccionado o contiene datos incompatibles.')
+      }
+      setConfiguracionGuardada({ kind: 'success', pronostico: esperado, data: body })
+    } catch (error) {
+      if (vigente()) setConfiguracionGuardada({ kind: 'error', id: esperado.id, message: mensajeError(error,
+        'No se pudo conectar para consultar la configuración guardada.') })
+    } finally {
+      if (solicitudConfiguracion.current === controller) solicitudConfiguracion.current = null
     }
   }
 
@@ -750,25 +909,62 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
           <h3 id="forecast-list-heading">Pronósticos almacenados</h3>
           <button type="button" onClick={() => { void consultarLista() }} disabled={lista.kind === 'loading'}>Actualizar listado</button>
         </div>
+        <div className="forecast-form">
+          <div>
+            <label htmlFor="forecast-history-technique">Filtrar historial por técnica</label>
+            <select id="forecast-history-technique" value={filtroTecnica} onChange={event => {
+              const valor = event.target.value
+              if (valor === '' || esTecnica(valor)) {
+                setFiltroTecnica(valor)
+                cerrarConfiguracion()
+              }
+            }}>
+              <option value="">Todas las técnicas</option>
+              {TECNICAS.map(t => <option key={t.id} value={t.id}>{t.nombre}</option>)}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="forecast-history-cutoff">Filtrar historial por corte</label>
+            <select id="forecast-history-cutoff" value={filtroCorte} onChange={event => {
+              const valor = event.target.value
+              if (valor === '' || esCorte(valor)) {
+                setFiltroCorte(valor)
+                cerrarConfiguracion()
+              }
+            }}>
+              <option value="">Todos los cortes</option>
+              {CORTES.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+        </div>
         {lista.kind === 'loading' && <p role="status">Cargando pronósticos almacenados…</p>}
         {lista.kind === 'error' && <p className="forecast-message forecast-message--error" role="alert">{lista.message}</p>}
         {lista.kind === 'success' && (lista.filas.length === 0
           ? <p role="status">No hay pronósticos almacenados para esta serie.</p>
+          : filasFiltradas.length === 0 ? <p role="status">No hay pronósticos que coincidan con los filtros seleccionados.</p>
           : <div className="forecast-table-wrap" tabIndex={0} role="region" aria-label="Listado de pronósticos">
             <table>
               <caption>Resultados disponibles de la serie seleccionada</caption>
               <thead><tr><th scope="col">Técnica</th><th scope="col">Corte</th><th scope="col">Periodo (15 días)</th>
                 <th scope="col">Generación</th><th scope="col">Acción</th></tr></thead>
-              <tbody>{lista.filas.map(p => <tr key={p.id}>
-                <td>{nombreTecnica(p.tecnica)}</td><td>{p.fecha_corte}</td>
+              <tbody>{filasFiltradas.map(p => <tr key={p.id}>
+                <td>{nombreTecnica(p.tecnica)}<br /><small>Pronóstico {p.id} · Experimento {p.experimento_id}</small></td><td>{p.fecha_corte}</td>
                 <td>{fechaFutura(p.fecha_corte, 1)} a {fechaFutura(p.fecha_corte, 15)}</td>
                 <td>{formatoGeneracion.format(new Date(p.fecha_generacion))}</td>
-                <td><button type="button" disabled={detalle.kind === 'loading' && detalle.id === p.id}
+                <td className="forecast-history-actions"><button type="button" disabled={detalle.kind === 'loading' && detalle.id === p.id}
                   aria-label={`Ver pronóstico de ${nombreTecnica(p.tecnica)} con corte ${p.fecha_corte}`}
-                  onClick={() => { void consultarDetalle(p) }}>Ver pronóstico</button></td>
+                  onClick={() => { void consultarDetalle(p) }}>Ver pronóstico</button>
+                  <button type="button" disabled={configuracionGuardada.kind === 'loading' && configuracionGuardada.id === p.id}
+                    aria-label={`Ver configuración del pronóstico ${p.id}`}
+                    onClick={() => { void consultarConfiguracion(p) }}>Ver configuración</button></td>
               </tr>)}</tbody>
             </table>
           </div>)}
+        {configuracionGuardada.kind === 'loading' && <p role="status">Consultando la configuración del pronóstico {configuracionGuardada.id}…</p>}
+        {configuracionGuardada.kind === 'error' && <p className="forecast-message forecast-message--error" role="alert">
+          Pronóstico {configuracionGuardada.id} · {configuracionGuardada.message}</p>}
+        {configuracionGuardada.kind === 'success' && <ConfiguracionPronostico
+          pronostico={configuracionGuardada.pronostico} data={configuracionGuardada.data} />}
       </section>
       {detalle.kind === 'loading' && <p className="forecast-message" role="status">Consultando detalle del pronóstico…</p>}
       {detalle.kind === 'error' && <p className="forecast-message forecast-message--error" role="alert">{detalle.message}</p>}
