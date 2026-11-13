@@ -76,38 +76,54 @@ def consultar_evaluacion(ruta_base: str | Path, pronostico_id: int) -> dict:
 
     try:
         with pronosticos._conexion_lectura(ruta) as conexion:
-            conjunto_id = pronosticos._activo(conexion)
-            fila = _cabecera(conexion, pronostico_id, conjunto_id)
-            metadatos = pronosticos._metadatos(fila)
-            if metadatos["tipo"] != "validacion":
-                raise ErrorConsultaEvaluacion("tipo_no_evaluable", "Solo se evalúan pronósticos de validación.")
-            corte = pronosticos._fecha(metadatos["fecha_corte"])
-            if corte not in metricas.CORTES_AUTORIZADOS:
-                raise ErrorConsultaEvaluacion("corte_no_autorizado", "El corte no pertenece a las ventanas autorizadas.")
-            detalles = pronosticos._detalles_validos(conexion, pronostico_id, metadatos)
-            observaciones = conexion.execute(
-                "SELECT fecha, sales FROM venta_diaria "
-                "WHERE serie_id = ? AND fecha > ? AND fecha <= ? ORDER BY fecha",
-                (fila["serie_id"], corte.isoformat(),
-                 (corte + timedelta(days=metricas.HORIZONTE_DIAS)).isoformat()),
-            ).fetchall()
-            evaluacion = metricas.calcular_metricas(
-                metadatos["fecha_corte"], [dict(d) for d in detalles], [dict(o) for o in observaciones])
-            cantidad = evaluacion["observaciones_evaluadas"]
-            if cantidad == metricas.HORIZONTE_DIAS:
-                estado, alcance = "completa", "Métricas sobre las quince observaciones del horizonte."
-            elif cantidad:
-                estado, alcance = "parcial", "Métricas sobre observaciones disponibles."
-            else:
-                estado, alcance = "sin_observaciones", "Sin observaciones reales; métricas no definidas."
-            return {
-                "conjunto_id": conjunto_id,
-                "serie": {"id": fila["serie_id"], "store_nbr": fila["store_nbr"], "family": fila["family"]},
-                "pronostico_id": metadatos["id"], "experimento_id": metadatos["experimento_id"],
-                "tecnica": metadatos["tecnica"], "fecha_corte": metadatos["fecha_corte"],
-                "horizonte": metadatos["horizonte"], "estado_cobertura": estado,
-                "alcance_metricas": alcance, "evaluacion": evaluacion,
-            }
+            return _evaluar_en_conexion(conexion, pronostico_id)
+    except pronosticos.ErrorConsultaPronostico as error:
+        if error.codigo in ("base_no_disponible", "sin_conjunto_activo"):
+            raise ErrorConsultaEvaluacion(error.codigo, str(error)) from error
+        raise _inconsistente() from error
+    except metricas.ErrorMetricasEvaluacion as error:
+        raise _inconsistente() from error
+
+
+def _evaluar_en_conexion(conexion, pronostico_id: int) -> dict:
+    """Calcula A2 en la conexión y transacción del llamador, con filas sqlite3.Row.
+
+    El llamador valida el ID y administra apertura, BEGIN, commit/rollback y
+    cierre. Este helper solo consulta y calcula; no cambia la transacción.
+    """
+    try:
+        conjunto_id = pronosticos._activo(conexion)
+        fila = _cabecera(conexion, pronostico_id, conjunto_id)
+        metadatos = pronosticos._metadatos(fila)
+        if metadatos["tipo"] != "validacion":
+            raise ErrorConsultaEvaluacion("tipo_no_evaluable", "Solo se evalúan pronósticos de validación.")
+        corte = pronosticos._fecha(metadatos["fecha_corte"])
+        if corte not in metricas.CORTES_AUTORIZADOS:
+            raise ErrorConsultaEvaluacion("corte_no_autorizado", "El corte no pertenece a las ventanas autorizadas.")
+        detalles = pronosticos._detalles_validos(conexion, pronostico_id, metadatos)
+        observaciones = conexion.execute(
+            "SELECT fecha, sales FROM venta_diaria "
+            "WHERE serie_id = ? AND fecha > ? AND fecha <= ? ORDER BY fecha",
+            (fila["serie_id"], corte.isoformat(),
+             (corte + timedelta(days=metricas.HORIZONTE_DIAS)).isoformat()),
+        ).fetchall()
+        evaluacion = metricas.calcular_metricas(
+            metadatos["fecha_corte"], [dict(d) for d in detalles], [dict(o) for o in observaciones])
+        cantidad = evaluacion["observaciones_evaluadas"]
+        if cantidad == metricas.HORIZONTE_DIAS:
+            estado, alcance = "completa", "Métricas sobre las quince observaciones del horizonte."
+        elif cantidad:
+            estado, alcance = "parcial", "Métricas sobre observaciones disponibles."
+        else:
+            estado, alcance = "sin_observaciones", "Sin observaciones reales; métricas no definidas."
+        return {
+            "conjunto_id": conjunto_id,
+            "serie": {"id": fila["serie_id"], "store_nbr": fila["store_nbr"], "family": fila["family"]},
+            "pronostico_id": metadatos["id"], "experimento_id": metadatos["experimento_id"],
+            "tecnica": metadatos["tecnica"], "fecha_corte": metadatos["fecha_corte"],
+            "horizonte": metadatos["horizonte"], "estado_cobertura": estado,
+            "alcance_metricas": alcance, "evaluacion": evaluacion,
+        }
     except pronosticos.ErrorConsultaPronostico as error:
         if error.codigo in ("base_no_disponible", "sin_conjunto_activo"):
             raise ErrorConsultaEvaluacion(error.codigo, str(error)) from error
