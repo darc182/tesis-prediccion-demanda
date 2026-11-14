@@ -3,6 +3,7 @@ import HistoricoVentas from './components/HistoricoVentas'
 import PerfilSerie from './components/PerfilSerie'
 import PerfilGlobalDatos from './components/PerfilGlobalDatos'
 import PronosticosVentas from './components/PronosticosVentas'
+import ComparacionEvaluaciones from './components/ComparacionEvaluaciones'
 import SelectorSerie, { type SerieTemporal, type SeriesState } from './components/SelectorSerie'
 import './App.css'
 
@@ -436,7 +437,25 @@ function App() {
         <PronosticosVentas seleccion={seleccionHistorico} activo={vista === 'pronosticos'} />
       </section>
 
-      {(vista === 'comparacion' || vista === 'simulacion') && (
+      <section className="app-view" aria-label="Comparación" hidden={vista !== 'comparacion'}>
+        <SelectorSerie
+          idPrefix="comparacion"
+          state={seriesState}
+          selectedStore={selectedStore}
+          selectedFamily={selectedFamily}
+          onStoreChange={handleStoreChange}
+          onFamilyChange={handleFamilyChange}
+          onRetry={handleRetrySeries}
+        />
+        <ComparacionEvaluaciones
+          key={seleccionHistorico ? `comparacion:${seleccionHistorico.conjuntoId}:${seleccionHistorico.serie.id}:${seleccionHistorico.serie.store_nbr}:${seleccionHistorico.serie.family}` : 'comparacion-sin-serie'}
+          seleccion={seleccionHistorico}
+          estadoConjunto={seriesState.kind}
+          activo={vista === 'comparacion'}
+        />
+      </section>
+
+      {vista === 'simulacion' && (
         <section className="pending-view" aria-labelledby="pending-heading">
           <h2 id="pending-heading">{apartados.find((apartado) => apartado.id === vista)?.nombre}</h2>
           <p>Este apartado todavía no está disponible.</p>
