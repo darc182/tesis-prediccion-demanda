@@ -1,9 +1,9 @@
-"""Consulta HTTP de métricas actuales; no consulta ni registra filas de evaluación."""
+"""Consulta actual y registro explícito de evaluaciones; sin operaciones al importar."""
 
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Path as ParametroRuta, Request
+from fastapi import APIRouter, Depends, Path as ParametroRuta, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
@@ -11,6 +11,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from backend.app.api.datasets import obtener_ruta_base
 from backend.app.services.consulta_evaluaciones import ErrorConsultaEvaluacion, consultar_evaluacion
+from backend.app.services.registro_evaluaciones import ErrorRegistroEvaluacion, registrar_evaluacion
 from backend.app.services.validacion_csv import MAX_ENTERO_SQLITE
 
 
@@ -29,10 +30,19 @@ ERRORES = {
 }
 
 
-def _respuesta_error(codigo):
-    if type(codigo) is not str or codigo not in ERRORES:
+ERRORES_REGISTRO = {
+    **ERRORES,
+    "evaluacion_desactualizada": (409, "La evaluación guardada no coincide con los datos actuales; no se sobrescribió."),
+    "error_persistencia": (503, "No se pudo completar el registro de la evaluación."),
+    "error_interno": (500, "No se pudo completar la solicitud de registro de evaluación."),
+}
+
+
+def _respuesta_error(codigo, *, registro=False):
+    errores = ERRORES_REGISTRO if registro else ERRORES
+    if type(codigo) is not str or codigo not in errores:
         codigo = "error_interno"
-    estado, mensaje = ERRORES[codigo]
+    estado, mensaje = errores[codigo]
     return JSONResponse(status_code=estado, content={"detail": {"codigo": codigo, "mensaje": mensaje}})
 
 
@@ -41,19 +51,22 @@ class RutaEvaluaciones(APIRoute):
 
     def get_route_handler(self):
         original = super().get_route_handler()
+        es_registro = "POST" in self.methods
 
         async def manejar(request: Request):
             try:
                 if request.query_params or await request.body():
-                    respuesta = _respuesta_error("entrada_invalida")
+                    respuesta = _respuesta_error("entrada_invalida", registro=es_registro)
                 else:
                     respuesta = await original(request)
             except RequestValidationError:
-                respuesta = _respuesta_error("pronostico_invalido")
+                respuesta = _respuesta_error("pronostico_invalido", registro=es_registro)
             except ErrorConsultaEvaluacion as error:
-                respuesta = _respuesta_error(error.codigo)
+                respuesta = _respuesta_error(error.codigo, registro=es_registro)
+            except ErrorRegistroEvaluacion as error:
+                respuesta = _respuesta_error(error.codigo if es_registro else "error_interno", registro=es_registro)
             except Exception:
-                respuesta = _respuesta_error("error_interno")
+                respuesta = _respuesta_error("error_interno", registro=es_registro)
             respuesta.headers["Cache-Control"] = "no-store"
             return respuesta
 
@@ -107,6 +120,12 @@ class ConsultaEvaluacion(ModeloEvaluaciones):
     evaluacion: MetricasEvaluacion
 
 
+class RegistroEvaluacion(ConsultaEvaluacion):
+    estado_registro: Literal["creado", "reutilizado", "no_guardado"]
+    hubo_escritura: bool
+    motivo: Literal["sin_observaciones"] | None
+
+
 class DetalleErrorEvaluacion(ModeloEvaluaciones):
     codigo: str
     mensaje: str
@@ -135,6 +154,18 @@ def _entero_ruta(valor):
     return valor
 
 
+RESPUESTAS_REGISTRO = {
+    **{estado: contenido for estado, contenido in RESPUESTAS.items() if estado != 200},
+    200: {"model": RegistroEvaluacion, "description": "Evaluación reutilizada, o no_guardado por falta de observaciones; "
+                                                    "no implica que se haya insertado una fila.",
+          "headers": CABECERA_CACHE},
+    201: {"description": "Nueva evaluación insertada y confirmada por B1.", "headers": CABECERA_CACHE},
+    409: {**RESPUESTAS[409], "description": "sin_conjunto_activo, datos_inconsistentes o evaluacion_desactualizada; "
+                                          "sin sobrescribir ni eliminar la evaluación anterior."},
+    503: {**RESPUESTAS[503], "description": "base_no_disponible o error_persistencia."},
+}
+
+
 router = APIRouter(prefix="/api/evaluaciones", tags=["evaluaciones"], route_class=RutaEvaluaciones)
 
 
@@ -157,3 +188,29 @@ def evaluacion_actual(
     Los éxitos y errores de la consulta llevan Cache-Control: no-store.
     """
     return consultar_evaluacion(ruta_base, pronostico_id)
+
+
+@router.post("/active/{pronostico_id}", status_code=201, response_model=RegistroEvaluacion,
+             responses=RESPUESTAS_REGISTRO, summary="Registrar explícitamente una evaluación de validación")
+def guardar_evaluacion(
+    pronostico_id: Annotated[int, ParametroRuta(gt=0, le=MAX_ENTERO_SQLITE), BeforeValidator(_entero_ruta)],
+    respuesta: Response,
+    ruta_base: Path = Depends(obtener_ruta_base),
+):
+    """Delega exactamente una vez en registrar_evaluacion, sin SQL ni cálculo propio.
+
+    Acción explícita sin cuerpo ni parámetros adicionales. B1 guarda coberturas
+    completas o parciales y devuelve los conteos y fechas actuales. HTTP 201
+    significa creado; HTTP 200 puede ser reutilizado o no_guardado. Sin reales
+    no se guarda y las métricas son null. WAPE indefinido se conserva como null.
+    Los conflictos devuelven 409 sin sobrescribir ni eliminar filas anteriores.
+
+    Reutilizar métricas numéricamente iguales no acredita identidad histórica
+    ni vigencia permanente. El GET conserva su cálculo actual independiente.
+    No repetir solicitudes automáticamente ante un fallo de red: la transacción
+    podría haberse confirmado aunque el cliente no haya recibido la respuesta.
+    Éxitos y errores gestionados incluyen Cache-Control: no-store.
+    """
+    resultado = RegistroEvaluacion.model_validate(registrar_evaluacion(ruta_base, pronostico_id))
+    respuesta.status_code = 201 if resultado.estado_registro == "creado" else 200
+    return resultado

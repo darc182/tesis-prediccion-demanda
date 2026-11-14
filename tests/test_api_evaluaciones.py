@@ -1,12 +1,16 @@
-"""HU005-C1: GET actual con TestClient y SQLite exclusivamente sintéticas."""
+"""HU005-C1/C2: GET y POST con TestClient y SQLite exclusivamente sintéticas."""
 
 from contextlib import contextmanager, ExitStack
 from copy import deepcopy
 from math import sqrt
+from pathlib import Path
 import sqlite3
+import sys
+from types import ModuleType
 import unittest
 from unittest.mock import patch
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.app.api import datasets, evaluaciones as api, pronosticos
@@ -69,10 +73,11 @@ class ApiEvaluacionesTests(unittest.TestCase):
             for hijo in valor:
                 self.comprobar_sin_estados_guardados(hijo)
 
-    def comprobar_error(self, respuesta, estado, codigo):
+    def comprobar_error(self, respuesta, estado, codigo, *, errores=None):
+        errores = api.ERRORES if errores is None else errores
         self.assertEqual(respuesta.status_code, estado, respuesta.text)
         self.assertEqual(respuesta.headers.get("cache-control"), "no-store")
-        self.assertEqual(respuesta.json(), {"detail": {"codigo": codigo, "mensaje": api.ERRORES[codigo][1]}})
+        self.assertEqual(respuesta.json(), {"detail": {"codigo": codigo, "mensaje": errores[codigo][1]}})
         for privado in ("PRIVADO", "SELECT", "Traceback", str(self.ruta)):
             self.assertNotIn(privado, respuesta.text)
 
@@ -364,7 +369,7 @@ class ApiEvaluacionesTests(unittest.TestCase):
     def test_openapi_contrato_errores_cache_y_distincion_de_persistencia(self):
         esquema = self.cliente.get("/openapi.json").json()
         ruta = esquema["paths"][f"{PREFIJO}/{{pronostico_id}}"]
-        self.assertEqual(set(ruta), {"get"})
+        self.assertEqual(set(ruta), {"get", "post"})
         operacion = ruta["get"]
         self.assertNotIn("requestBody", operacion)
         self.assertEqual([(p["name"], p["in"]) for p in operacion["parameters"]], [("pronostico_id", "path")])
@@ -408,7 +413,7 @@ class ApiEvaluacionesTests(unittest.TestCase):
         finally:
             app.openapi_schema = anterior
 
-    def test_routers_previos_y_health_conservados_sin_post_de_evaluacion(self):
+    def test_routers_previos_y_health_conservados(self):
         rutas = app.openapi()["paths"]
         for router in (datasets.router, pronosticos.router):
             for anterior in router.routes:
@@ -417,7 +422,397 @@ class ApiEvaluacionesTests(unittest.TestCase):
         self.assertEqual(self.cliente.get("/health").json(), {"status": "ok"})
         self.assertEqual(self.cliente.get("/api/datasets/active/series").status_code, 200)
         self.assertEqual(self.cliente.get("/api/pronosticos/active/101").status_code, 200)
-        self.assertEqual(self.cliente.post(f"{PREFIJO}/101").status_code, 405)
+        self.assertEqual(self.cliente.put(f"{PREFIJO}/101").status_code, 405)
+
+    def guardar(self, identificador=101, **opciones):
+        r = self.cliente.post(f"{PREFIJO}/{identificador}", **opciones)
+        self.assertEqual(r.headers.get("cache-control"), "no-store")
+        return r
+
+    def comprobar_error_post(self, respuesta, estado, codigo):
+        self.comprobar_error(respuesta, estado, codigo, errores=api.ERRORES_REGISTRO)
+
+    def filas_guardadas(self):
+        return self.datos.ejecutar("SELECT pronostico_id,mae,wape,rmse FROM evaluacion ORDER BY pronostico_id")
+
+    @contextmanager
+    def vigilar_registro_sql(self):
+        abrir_real = sqlite3.connect
+        trazas, aperturas, cierres = [], [], []
+
+        class Escritura(sqlite3.Connection):
+            def close(conexion):
+                cierres.append(True)
+                return super().close()
+
+        def abrir(ruta_uri, **opciones):
+            self.assertEqual(ruta_uri, self.ruta.resolve().as_uri() + "?mode=rw")
+            self.assertTrue(opciones["uri"])
+            c = abrir_real(ruta_uri, factory=Escritura, **opciones)
+            aperturas.append(True)
+            c.set_trace_callback(trazas.append)
+            return c
+
+        with patch.object(sqlite3, "connect", side_effect=abrir):
+            yield trazas
+        self.assertEqual(aperturas, [True])
+        self.assertEqual(cierres, [True])
+
+    def test_post_nuevo_201_una_fila_y_resultado_completo(self):
+        esperado = consulta.consultar_evaluacion(self.ruta, 101)
+        r = self.guardar()
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json(), {**esperado, "estado_registro": "creado", "hubo_escritura": True, "motivo": None})
+        self.assertEqual(self.filas_guardadas(), [(101, 2, 10, sqrt(20 / 3))])
+        self.assertNotIn("PRIVADO", r.text)
+
+    def test_post_repetido_200_reutiliza_sin_dml(self):
+        primero = self.guardar().json()
+        contenido, guardada = self.ruta.read_bytes(), self.filas_guardadas()
+        with self.vigilar_registro_sql() as trazas:
+            segundo = self.guardar()
+        self.assertEqual(segundo.status_code, 200, segundo.text)
+        self.assertEqual(segundo.json(), {**primero, "estado_registro": "reutilizado", "hubo_escritura": False})
+        self.assertFalse(any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) for s in trazas))
+        self.assertEqual(self.filas_guardadas(), guardada)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_post_sin_observaciones_200_no_guardado(self):
+        self.datos.ejecutar("DELETE FROM venta_diaria")
+        contenido = self.ruta.read_bytes()
+        with self.vigilar_registro_sql() as trazas:
+            r = self.guardar()
+        self.assertEqual(r.status_code, 200, r.text)
+        datos = r.json()
+        self.assertEqual((datos["estado_registro"], datos["hubo_escritura"], datos["motivo"]),
+                         ("no_guardado", False, "sin_observaciones"))
+        self.assertEqual(datos["estado_cobertura"], "sin_observaciones")
+        e = datos["evaluacion"]
+        self.assertEqual(tuple(e[c] for c in ("mae", "wape", "rmse")), (None, None, None))
+        self.assertEqual((e["observaciones_evaluadas"], e["fechas_sin_registro"], e["cobertura"]), (0, 15, 0))
+        self.assertEqual(self.filas_guardadas(), [])
+        self.assertFalse(any(s.lstrip().upper().startswith("INSERT") for s in trazas))
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_post_sin_observaciones_con_fila_antigua_409(self):
+        self.guardar()
+        guardada = self.filas_guardadas()
+        self.datos.ejecutar("DELETE FROM venta_diaria")
+        contenido = self.ruta.read_bytes()
+        self.comprobar_error_post(self.guardar(), 409, "evaluacion_desactualizada")
+        self.assertEqual(self.filas_guardadas(), guardada)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_post_cobertura_parcial_con_ausencias_interiores(self):
+        faltan = (2, 8, 11)
+        for paso in faltan:
+            self.datos.ejecutar("DELETE FROM venta_diaria WHERE fecha=?", (fixtures.fecha_objetivo(fixtures.CORTES[0], paso),))
+        esperado = consulta.consultar_evaluacion(self.ruta, 101)
+        r = self.guardar()
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json(), {**esperado, "estado_registro": "creado", "hubo_escritura": True, "motivo": None})
+        e = r.json()["evaluacion"]
+        self.assertEqual((e["observaciones_evaluadas"], e["cobertura"]), (12, 12 / 15))
+        self.assertEqual(e["fechas_ausentes"], [fixtures.fecha_objetivo(fixtures.CORTES[0], p) for p in faltan])
+        self.assertEqual(self.filas_guardadas(), [(101, e["mae"], e["wape"], e["rmse"])])
+
+    def test_post_ventas_cero_guarda_wape_sql_null(self):
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=0")
+        self.datos.ejecutar("UPDATE detalle_pronostico SET venta_estimada=2")
+        r = self.guardar()
+        self.assertEqual(r.status_code, 201, r.text)
+        e = r.json()["evaluacion"]
+        self.assertEqual((e["mae"], e["wape"], e["rmse"]), (2, None, 2))
+        self.assertEqual(self.filas_guardadas(), [(101, 2, None, 2)])
+        self.assertEqual(self.datos.ejecutar("SELECT typeof(wape) FROM evaluacion"), [("null",)])
+
+    def test_post_cambio_de_ventas_conflicto_sin_sobrescribir(self):
+        self.guardar()
+        guardada = self.filas_guardadas()
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=11 WHERE fecha='2017-06-17'")
+        contenido = self.ruta.read_bytes()
+        self.comprobar_error_post(self.guardar(), 409, "evaluacion_desactualizada")
+        self.assertEqual(self.filas_guardadas(), guardada)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_post_cambio_de_prediccion_conflicto_sin_sobrescribir(self):
+        self.guardar()
+        guardada = self.filas_guardadas()
+        self.datos.ejecutar("UPDATE detalle_pronostico SET venta_estimada=9 WHERE paso=1")
+        self.comprobar_error_post(self.guardar(), 409, "evaluacion_desactualizada")
+        self.assertEqual(self.filas_guardadas(), guardada)
+
+    def test_post_fila_previa_corrupta_conflicto_sin_filtraciones(self):
+        self.guardar()
+        for campo, valor in (("mae", "PRIVADO SELECT"), ("mae", -1), ("wape", None), ("rmse", None)):
+            with self.subTest(campo=campo, valor=valor):
+                self.datos.ejecutar("UPDATE evaluacion SET mae=?,wape=?,rmse=?", (2, 10, sqrt(20 / 3)))
+                self.datos.corromper(f"UPDATE evaluacion SET {campo}=?", (valor,))
+                guardada = self.filas_guardadas()
+                contenido = self.ruta.read_bytes()
+                self.comprobar_error_post(self.guardar(), 409, "evaluacion_desactualizada")
+                self.assertEqual(self.filas_guardadas(), guardada)
+                self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_post_pronostico_inexistente_o_inactivo(self):
+        self.comprobar_error_post(self.guardar(999), 404, "pronostico_inexistente")
+        self.datos.crear_pronostico(102, 202, serie=24)
+        self.comprobar_error_post(self.guardar(102), 404, "pronostico_inactivo")
+        self.assertEqual(self.filas_guardadas(), [])
+
+    def test_post_sin_conjunto_activo(self):
+        self.datos.ejecutar("UPDATE conjunto_datos SET activo=0")
+        self.comprobar_error_post(self.guardar(), 409, "sin_conjunto_activo")
+
+    def test_post_tipo_y_corte_no_autorizados_sin_leer_ventas(self):
+        for tipo, corte, codigo in (("prueba", fixtures.CORTES[0], "tipo_no_evaluable"),
+                                    ("futuro", "2017-07-31", "tipo_no_evaluable"),
+                                    ("validacion", "2017-07-31", "corte_no_autorizado"),
+                                    ("validacion", "2017-06-17", "corte_no_autorizado")):
+            self.datos.ejecutar("UPDATE pronostico SET tipo=?,fecha_corte=?", (tipo, corte))
+            with self.subTest(tipo=tipo, corte=corte), self.vigilar_registro_sql() as trazas:
+                self.comprobar_error_post(self.guardar(), 422, codigo)
+            self.assertFalse(any("FROM venta_diaria" in sql for sql in trazas))
+        self.assertEqual(self.filas_guardadas(), [])
+
+    def test_post_ids_invalidos_ascii_y_limite_sqlite(self):
+        with patch.object(api, "registrar_evaluacion") as guardar, patch.object(api, "consultar_evaluacion") as consultar:
+            for valor in ("0", "-1", "1.5", "101.0", "1e2", "true", "abc", "+101", " 101", "１２", "١", str(MAX_ID + 1)):
+                with self.subTest(valor=valor):
+                    self.comprobar_error_post(self.guardar(valor), 422, "pronostico_invalido")
+            guardar.assert_not_called()
+            consultar.assert_not_called()
+        with patch.object(api, "registrar_evaluacion", wraps=registro.registrar_evaluacion) as guardar:
+            self.comprobar_error_post(self.guardar(MAX_ID), 404, "pronostico_inexistente")
+        guardar.assert_called_once_with(self.ruta, MAX_ID)
+
+    def test_post_cuerpos_incluso_json_vacio_rechazados(self):
+        with patch.object(api, "registrar_evaluacion") as guardar:
+            for cuerpo in (b"{}", b"[]", b"null", b" ", b"PRIVADO JSON malformado"):
+                with self.subTest(cuerpo=cuerpo):
+                    self.comprobar_error_post(self.guardar(content=cuerpo, headers={"Content-Type": "application/json"}),
+                                             422, "entrada_invalida")
+            guardar.assert_not_called()
+
+    def test_post_parametros_adicionales_rechazados(self):
+        with patch.object(api, "registrar_evaluacion") as guardar:
+            for parametros in ({"fecha_corte": fixtures.CORTES[0]}, {"otro": "PRIVADO"},
+                               [("otro", "1"), ("otro", "2")], {"otro": ""}):
+                with self.subTest(parametros=parametros):
+                    self.comprobar_error_post(self.guardar(params=parametros), 422, "entrada_invalida")
+            guardar.assert_not_called()
+
+    def test_post_base_inexistente_corrupta_o_sin_esquema(self):
+        ausente = self.ruta.parent / "PRIVADO_ausente.sqlite3"
+        app.dependency_overrides[obtener_ruta_base] = lambda: ausente
+        self.comprobar_error_post(self.guardar(), 503, "base_no_disponible")
+        self.assertFalse(ausente.exists())
+        for nombre, contenido in (("corrupta.sqlite3", b"Esto no es SQLite"), ("vacia.sqlite3", b"")):
+            ruta = self.ruta.parent / nombre
+            ruta.write_bytes(contenido)
+            app.dependency_overrides[obtener_ruta_base] = lambda: ruta
+            self.comprobar_error_post(self.guardar(), 503, "base_no_disponible")
+            self.assertEqual(ruta.read_bytes(), contenido)
+
+    def test_post_error_de_persistencia_503_con_rollback(self):
+        self.datos.ejecutar("CREATE TRIGGER fallo BEFORE INSERT ON evaluacion "
+                            "BEGIN SELECT RAISE(ABORT,'PRIVADO INSERT C:/secreto'); END")
+        contenido = self.ruta.read_bytes()
+        with self.vigilar_registro_sql() as trazas:
+            self.comprobar_error_post(self.guardar(), 503, "error_persistencia")
+        self.assertIn("ROLLBACK", trazas)
+        self.assertEqual(self.filas_guardadas(), [])
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_post_fallo_tras_insert_revierte_fila_pendiente(self):
+        abrir_real = sqlite3.connect
+        trazas = []
+
+        class Fallida(sqlite3.Connection):
+            def execute(conexion, sql, parametros=()):
+                cursor = super().execute(sql, parametros)
+                if sql.startswith("INSERT INTO evaluacion"):
+                    raise sqlite3.OperationalError("PRIVADO fallo tras INSERT")
+                return cursor
+
+        def abrir(ruta_uri, **opciones):
+            c = abrir_real(ruta_uri, factory=Fallida, **opciones)
+            c.set_trace_callback(trazas.append)
+            return c
+
+        contenido = self.ruta.read_bytes()
+        with patch.object(sqlite3, "connect", side_effect=abrir):
+            self.comprobar_error_post(self.guardar(), 503, "error_persistencia")
+        self.assertIn("ROLLBACK", trazas)
+        self.assertEqual(self.filas_guardadas(), [])
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def test_post_delega_exactamente_una_vez_en_b1_sin_consulta_publica_a2(self):
+        with patch.object(api, "registrar_evaluacion", wraps=registro.registrar_evaluacion) as guardar, \
+                patch.object(api, "consultar_evaluacion", side_effect=AssertionError("No consultar por GET")) as consultar:
+            self.assertEqual(self.guardar().status_code, 201)
+            guardar.assert_called_once_with(self.ruta, 101)
+            consultar.assert_not_called()
+
+    def test_post_modelo_pydantic_rechaza_datos_privados_y_tipos_invalidos(self):
+        valido = {**consulta.consultar_evaluacion(self.ruta, 101),
+                  "estado_registro": "creado", "hubo_escritura": True, "motivo": None}
+        for campo, valor in (("PRIVADO", "ruta interna"), ("estado_registro", "PRIVADO"),
+                              ("hubo_escritura", "true"), ("motivo", "PRIVADO")):
+            incorrecto = {**deepcopy(valido), campo: valor}
+            with self.subTest(campo=campo), patch.object(api, "registrar_evaluacion", return_value=incorrecto) as guardar:
+                self.comprobar_error_post(self.guardar(), 500, "error_interno")
+                guardar.assert_called_once_with(self.ruta, 101)
+        self.assertEqual(self.filas_guardadas(), [])
+
+    def test_post_mapeo_constante_y_proteccion_de_mensajes_internos(self):
+        codigos = (("pronostico_invalido", 422), ("tipo_no_evaluable", 422), ("corte_no_autorizado", 422),
+                   ("pronostico_inexistente", 404), ("pronostico_inactivo", 404), ("sin_conjunto_activo", 409),
+                   ("datos_inconsistentes", 409), ("evaluacion_desactualizada", 409),
+                   ("base_no_disponible", 503), ("error_persistencia", 503))
+        for codigo, estado in codigos:
+            with self.subTest(codigo=codigo), patch.object(api, "registrar_evaluacion", side_effect=
+                    registro.ErrorRegistroEvaluacion(codigo, "PRIVADO SELECT C:/secreto Traceback")):
+                self.comprobar_error_post(self.guardar(), estado, codigo)
+
+    def test_post_codigos_desconocidos_y_errores_inesperados_500(self):
+        errores = [registro.ErrorRegistroEvaluacion(c, "PRIVADO") for c in ("PRIVADO codigo", None, [], {})]
+        errores += [RuntimeError("PRIVADO Traceback"), sqlite3.OperationalError("PRIVADO SQL"), OSError("PRIVADO ruta")]
+        for error in errores:
+            with self.subTest(error=type(error).__name__), patch.object(api, "registrar_evaluacion", side_effect=error) as guardar:
+                self.comprobar_error_post(self.guardar(), 500, "error_interno")
+                guardar.assert_called_once()
+
+    def test_post_openapi_documenta_200_201_errores_y_esquema_heredado(self):
+        esquema = self.cliente.get("/openapi.json").json()
+        ruta = esquema["paths"][f"{PREFIJO}/{{pronostico_id}}"]
+        self.assertEqual(set(ruta), {"get", "post"})
+        operacion = ruta["post"]
+        self.assertNotIn("requestBody", operacion)
+        self.assertEqual([(p["name"], p["in"]) for p in operacion["parameters"]], [("pronostico_id", "path")])
+        self.assertEqual(operacion["parameters"][0]["schema"]["maximum"], MAX_ID)
+        self.assertEqual(set(operacion["responses"]), {"200", "201", "422", "404", "409", "503", "500"})
+        self.assertIn("no_guardado", operacion["responses"]["200"]["description"])
+        self.assertIn("evaluacion_desactualizada", operacion["responses"]["409"]["description"])
+        self.assertIn("error_persistencia", operacion["responses"]["503"]["description"])
+        self.assertIn("no acredita identidad histórica", operacion["description"])
+        self.assertIn("No repetir solicitudes automáticamente", operacion["description"])
+        schemas = esquema["components"]["schemas"]
+        refs = [operacion["responses"][estado]["content"]["application/json"]["schema"] for estado in ("200", "201")]
+        self.assertEqual(refs[0], refs[1])
+        modelo = schemas[refs[0]["$ref"].rsplit("/", 1)[-1]]
+        self.assertEqual(set(modelo["properties"]), set(consulta.consultar_evaluacion(self.ruta, 101))
+                         | {"estado_registro", "hubo_escritura", "motivo"})
+        self.assertFalse(modelo["additionalProperties"])
+        self.assertEqual(modelo["properties"]["estado_registro"]["enum"], ["creado", "reutilizado", "no_guardado"])
+        self.assertEqual(modelo["properties"]["hubo_escritura"]["type"], "boolean")
+        self.assertEqual({x["type"] for x in modelo["properties"]["motivo"]["anyOf"]}, {"string", "null"})
+        for contenido in operacion["responses"].values():
+            self.assertEqual(contenido["headers"]["Cache-Control"]["schema"]["const"], "no-store")
+
+    def test_post_get_posterior_conserva_contrato_ro_y_no_llama_b1(self):
+        esperado = self.consultar()
+        self.assertEqual(self.guardar().status_code, 201)
+        guardada = self.filas_guardadas()
+        with patch.object(api, "registrar_evaluacion", side_effect=AssertionError("No registrar en GET")) as guardar, \
+                self.vigilar_sql():
+            self.assertEqual(self.consultar(), esperado)
+            guardar.assert_not_called()
+        self.assertEqual(self.filas_guardadas(), guardada)
+
+    def test_post_get_tras_cambiar_ventas_refleja_calculo_actual(self):
+        self.guardar()
+        guardada = self.filas_guardadas()
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=11 WHERE fecha='2017-06-17'")
+        with self.vigilar_sql():
+            actual = self.consultar()
+        self.assertEqual(actual["evaluacion"]["mae"], 31 / 15)
+        self.assertEqual(actual["evaluacion"]["wape"], (31 / 301) * 100)
+        self.assertAlmostEqual(actual["evaluacion"]["rmse"], sqrt(7))
+        self.assertEqual(self.filas_guardadas(), guardada)
+        self.comprobar_error_post(self.guardar(), 409, "evaluacion_desactualizada")
+
+    def test_post_y_get_no_ejecutan_modelos_predictivos(self):
+        objetivos = ((generacion, "registrar_pronostico"), (generacion, "_calcular"),
+                     (modelos_prediccion, "entrenar_modelo"), (modelos_prediccion, "crear_estimador"),
+                     (modelos_prediccion, "pronosticar_recursivo"), (linea_base_prediccion, "pronosticar_serie"),
+                     (pronosticos, "registrar_pronostico"))
+        with ExitStack() as stack:
+            dobles = [stack.enter_context(patch.object(obj, nombre, side_effect=AssertionError(nombre)))
+                      for obj, nombre in objetivos]
+            self.assertEqual(self.guardar().status_code, 201)
+            self.consultar()
+            for doble in dobles:
+                doble.assert_not_called()
+
+    def test_post_importacion_arranque_y_openapi_no_ejecutan_registros(self):
+        codigo = compile(Path(api.__file__).read_text(encoding="utf-8"), api.__file__, "exec")
+        aislado = ModuleType("api_evaluaciones_c2_en_prueba")
+        with patch.dict(sys.modules, {aislado.__name__: aislado}), \
+                patch.object(registro, "registrar_evaluacion", side_effect=AssertionError("No registrar")) as guardar, \
+                patch.object(consulta, "consultar_evaluacion", side_effect=AssertionError("No consultar")) as consultar, \
+                patch.object(sqlite3, "connect", side_effect=AssertionError("No abrir SQLite")):
+            exec(codigo, aislado.__dict__)
+            aplicacion = FastAPI()
+            aplicacion.include_router(aislado.router)
+            with TestClient(aplicacion) as cliente:
+                self.assertEqual(cliente.get("/openapi.json").status_code, 200)
+            guardar.assert_not_called()
+            consultar.assert_not_called()
+        self.assertEqual(self.filas_guardadas(), [])
+
+    def test_post_fallo_de_respuesta_despues_de_commit_no_reintenta(self):
+        def confirmar_y_fallar(*args):
+            registro.registrar_evaluacion(*args)
+            raise RuntimeError("PRIVADO fallo de respuesta tras confirmar")
+
+        with patch.object(api, "registrar_evaluacion", side_effect=confirmar_y_fallar) as guardar:
+            self.comprobar_error_post(self.guardar(), 500, "error_interno")
+            guardar.assert_called_once_with(self.ruta, 101)
+        self.assertEqual(self.filas_guardadas(), [(101, 2, 10, sqrt(20 / 3))])
+
+    def test_post_errores_nuevos_no_cambian_mapeo_del_get(self):
+        for error in (consulta.ErrorConsultaEvaluacion("evaluacion_desactualizada", "PRIVADO"),
+                      consulta.ErrorConsultaEvaluacion("error_persistencia", "PRIVADO"),
+                      registro.ErrorRegistroEvaluacion("base_no_disponible", "PRIVADO")):
+            with self.subTest(error=type(error).__name__), patch.object(api, "consultar_evaluacion", side_effect=error):
+                self.comprobar_error(self.obtener(), 500, "error_interno")
+
+    def test_post_tres_cortes_autorizados(self):
+        for i, corte in enumerate(fixtures.CORTES):
+            with self.subTest(corte=corte):
+                if i:
+                    self.datos.crear_pronostico(101 + i, 201 + i, corte=corte)
+                    self.datos.insertar_reales(corte=corte)
+                r = self.guardar(101 + i)
+                self.assertEqual(r.status_code, 201, r.text)
+                self.assertEqual(r.json()["fecha_corte"], corte)
+                self.assertEqual(tuple(r.json()["evaluacion"][c] for c in ("mae", "wape", "rmse")),
+                                 (2, 10, sqrt(20 / 3)))
+        self.assertEqual(len(self.filas_guardadas()), 3)
+
+    def test_post_fracciones_y_precision_sin_redondeo(self):
+        self.datos.ejecutar("DELETE FROM venta_diaria WHERE fecha>'2017-06-19'")
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=0")
+        self.datos.ejecutar("UPDATE detalle_pronostico SET venta_estimada=CASE WHEN paso=1 THEN 1 ELSE 0 END")
+        r = self.guardar()
+        self.assertEqual(r.status_code, 201, r.text)
+        e = r.json()["evaluacion"]
+        self.assertEqual((e["mae"], e["wape"], e["rmse"]), (1 / 3, None, sqrt(1 / 3)))
+        self.assertEqual(self.filas_guardadas(), [(101, e["mae"], None, e["rmse"])])
+
+    def test_post_reutiliza_metricas_iguales_con_cobertura_actual_distinta(self):
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=8")
+        self.datos.ejecutar("UPDATE detalle_pronostico SET venta_estimada=10")
+        self.assertEqual(self.guardar().status_code, 201)
+        self.datos.ejecutar("DELETE FROM venta_diaria WHERE fecha='2017-06-24'")
+        contenido = self.ruta.read_bytes()
+        r = self.guardar()
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual((r.json()["estado_registro"], r.json()["estado_cobertura"]), ("reutilizado", "parcial"))
+        self.assertEqual(r.json()["evaluacion"]["observaciones_evaluadas"], 14)
+        self.assertEqual(self.filas_guardadas(), [(101, 2, 25, 2)])
+        self.assertEqual(self.ruta.read_bytes(), contenido)
 
 
 if __name__ == "__main__":
