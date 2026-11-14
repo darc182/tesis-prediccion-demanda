@@ -3,13 +3,14 @@
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Path as ParametroRuta, Request, Response
+from fastapi import APIRouter, Depends, Path as ParametroRuta, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from backend.app.api.datasets import obtener_ruta_base
+from backend.app.services.comparacion_evaluaciones import ErrorComparacionEvaluaciones, comparar_evaluaciones
 from backend.app.services.consulta_evaluaciones import ErrorConsultaEvaluacion, consultar_evaluacion
 from backend.app.services.registro_evaluaciones import ErrorRegistroEvaluacion, registrar_evaluacion
 from backend.app.services.validacion_csv import MAX_ENTERO_SQLITE
@@ -38,8 +39,17 @@ ERRORES_REGISTRO = {
 }
 
 
-def _respuesta_error(codigo, *, registro=False):
-    errores = ERRORES_REGISTRO if registro else ERRORES
+ERRORES_COMPARACION = {
+    **ERRORES,
+    "entrada_invalida": (422, "Indique únicamente pronostico_id repetido dos o tres veces, con IDs distintos y sin cuerpo."),
+    "pronostico_invalido": (422, "Cada pronostico_id debe ser un entero decimal ASCII positivo dentro del límite SQLite."),
+    "pronosticos_no_comparables": (409, "Los pronósticos no comparten conjunto, serie, periodo y observaciones reales."),
+    "error_interno": (500, "No se pudo completar la comparación de evaluaciones."),
+}
+
+
+def _respuesta_error(codigo, *, registro=False, comparacion=False):
+    errores = ERRORES_COMPARACION if comparacion else ERRORES_REGISTRO if registro else ERRORES
     if type(codigo) is not str or codigo not in errores:
         codigo = "error_interno"
     estado, mensaje = errores[codigo]
@@ -52,21 +62,35 @@ class RutaEvaluaciones(APIRoute):
     def get_route_handler(self):
         original = super().get_route_handler()
         es_registro = "POST" in self.methods
+        es_comparacion = self.name == "comparacion_actual"
 
         async def manejar(request: Request):
             try:
-                if request.query_params or await request.body():
-                    respuesta = _respuesta_error("entrada_invalida", registro=es_registro)
+                if es_comparacion:
+                    query_invalida = bool(set(request.query_params) - {"pronostico_id"})
+                else:
+                    query_invalida = bool(request.query_params)
+                if query_invalida or await request.body():
+                    respuesta = _respuesta_error("entrada_invalida", registro=es_registro, comparacion=es_comparacion)
                 else:
                     respuesta = await original(request)
-            except RequestValidationError:
-                respuesta = _respuesta_error("pronostico_invalido", registro=es_registro)
+            except RequestValidationError as error:
+                codigo = "pronostico_invalido"
+                if es_comparacion and not any(e["loc"][:2] == ("query", "pronostico_id") and len(e["loc"]) > 2
+                                             for e in error.errors()):
+                    codigo = "entrada_invalida"
+                respuesta = _respuesta_error(codigo, registro=es_registro, comparacion=es_comparacion)
             except ErrorConsultaEvaluacion as error:
-                respuesta = _respuesta_error(error.codigo, registro=es_registro)
+                respuesta = _respuesta_error("error_interno" if es_comparacion else error.codigo,
+                                             registro=es_registro, comparacion=es_comparacion)
             except ErrorRegistroEvaluacion as error:
-                respuesta = _respuesta_error(error.codigo if es_registro else "error_interno", registro=es_registro)
+                respuesta = _respuesta_error(error.codigo if es_registro else "error_interno",
+                                             registro=es_registro, comparacion=es_comparacion)
+            except ErrorComparacionEvaluaciones as error:
+                respuesta = _respuesta_error(error.codigo if es_comparacion else "error_interno",
+                                             registro=es_registro, comparacion=es_comparacion)
             except Exception:
-                respuesta = _respuesta_error("error_interno", registro=es_registro)
+                respuesta = _respuesta_error("error_interno", registro=es_registro, comparacion=es_comparacion)
             respuesta.headers["Cache-Control"] = "no-store"
             return respuesta
 
@@ -126,6 +150,26 @@ class RegistroEvaluacion(ConsultaEvaluacion):
     motivo: Literal["sin_observaciones"] | None
 
 
+class ResultadoComparacion(ModeloEvaluaciones):
+    pronostico_id: int = Field(gt=0)
+    experimento_id: int = Field(gt=0)
+    tecnica: str
+    evaluacion: MetricasEvaluacion
+
+
+class ComparacionEvaluaciones(ModeloEvaluaciones):
+    conjunto_id: int = Field(gt=0)
+    serie: SerieEvaluacion
+    fecha_corte: str
+    horizonte: Literal[15]
+    estado_cobertura: Literal["completa", "parcial", "sin_observaciones"]
+    alcance_metricas: str
+    observaciones_evaluadas: int = Field(ge=0, le=15)
+    cobertura: float = Field(ge=0, le=1)
+    fechas_ausentes: list[str] = Field(max_length=15)
+    resultados: list[ResultadoComparacion] = Field(min_length=2, max_length=3)
+
+
 class DetalleErrorEvaluacion(ModeloEvaluaciones):
     codigo: str
     mensaje: str
@@ -154,6 +198,9 @@ def _entero_ruta(valor):
     return valor
 
 
+IdentificadorComparacion = Annotated[int, Field(gt=0, le=MAX_ENTERO_SQLITE), BeforeValidator(_entero_ruta)]
+
+
 RESPUESTAS_REGISTRO = {
     **{estado: contenido for estado, contenido in RESPUESTAS.items() if estado != 200},
     200: {"model": RegistroEvaluacion, "description": "Evaluación reutilizada, o no_guardado por falta de observaciones; "
@@ -166,7 +213,43 @@ RESPUESTAS_REGISTRO = {
 }
 
 
+RESPUESTAS_COMPARACION = {
+    **RESPUESTAS,
+    200: {"description": "Comparación actual de dos o tres pronósticos sobre las mismas observaciones.",
+          "headers": CABECERA_CACHE},
+    409: {**RESPUESTAS[409], "description": "sin_conjunto_activo, pronosticos_no_comparables o datos_inconsistentes; "
+                                          "sin resultados parciales."},
+}
+
+
 router = APIRouter(prefix="/api/evaluaciones", tags=["evaluaciones"], route_class=RutaEvaluaciones)
+
+
+@router.get("/comparacion/active", response_model=ComparacionEvaluaciones, responses=RESPUESTAS_COMPARACION,
+            summary="Comparar métricas actuales de dos o tres pronósticos")
+def comparacion_actual(
+    pronostico_id: Annotated[list[IdentificadorComparacion], Query(
+        min_length=2, max_length=3, json_schema_extra={"uniqueItems": True},
+        description="Repita pronostico_id dos o tres veces. IDs decimales ASCII positivos, distintos y dentro del "
+                    "límite SQLite; se conserva el orden solicitado.", examples=[[102, 101], [103, 101, 102]])],
+    ruta_base: Path = Depends(obtener_ruta_base),
+):
+    """Delega una sola llamada a comparar_evaluaciones con los IDs en el orden recibido.
+
+    Solo admite pronostico_id repetido dos o tres veces, sin cuerpo ni parámetros
+    adicionales. D1 verifica conjunto activo, serie, corte, horizonte y fechas
+    reales equivalentes, y calcula en una única instantánea SQLite de solo lectura.
+    Una incompatibilidad rechaza toda la comparación con HTTP 409.
+
+    Devuelve métricas actuales, incluidas coberturas parciales y fechas ausentes.
+    Sin observaciones las métricas son null; no se evalúa el desempeño predictivo.
+    No lee evaluaciones guardadas ni configuraciones privadas, no registra datos,
+    no entrena y no selecciona ganadores. No redondea ni sustituye null por cero.
+    Éxitos y errores gestionados incluyen Cache-Control: no-store.
+    """
+    if len(set(pronostico_id)) != len(pronostico_id):
+        return _respuesta_error("entrada_invalida", comparacion=True)
+    return comparar_evaluaciones(ruta_base, pronostico_id)
 
 
 @router.get("/active/{pronostico_id}", response_model=ConsultaEvaluacion, responses=RESPUESTAS,

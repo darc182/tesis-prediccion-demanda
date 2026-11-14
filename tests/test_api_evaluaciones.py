@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from backend.app.api import datasets, evaluaciones as api, pronosticos
 from backend.app.api.datasets import obtener_ruta_base
 from backend.app.main import app
+from backend.app.services import comparacion_evaluaciones as comparaciones
 from backend.app.services import consulta_evaluaciones as consulta
 from backend.app.services import registro_evaluaciones as registro
 from backend.app.services import registro_pronosticos as generacion
@@ -25,6 +26,7 @@ from tests import test_consulta_evaluaciones as fixtures
 
 PREFIJO = "/api/evaluaciones/active"
 MAX_ID = 2**63 - 1
+RUTA_COMPARACION = "/api/evaluaciones/comparacion/active"
 
 
 class ApiEvaluacionesTests(unittest.TestCase):
@@ -813,6 +815,366 @@ class ApiEvaluacionesTests(unittest.TestCase):
         self.assertEqual(r.json()["evaluacion"]["observaciones_evaluadas"], 14)
         self.assertEqual(self.filas_guardadas(), [(101, 2, 25, 2)])
         self.assertEqual(self.ruta.read_bytes(), contenido)
+
+    def preparar_comparacion(self, tres=False):
+        self.datos.crear_pronostico(102, 202, tecnica="random_forest", estimadas=fixtures.REALES)
+        if tres:
+            self.datos.crear_pronostico(103, 203, tecnica="hist_gradient_boosting", estimadas=[12, 16, 30] * 5)
+
+    def obtener_comparacion(self, ids=(101, 102), **opciones):
+        parametros = opciones.pop("params", [("pronostico_id", str(i)) for i in ids] if ids is not None else [])
+        r = self.cliente.request("GET", RUTA_COMPARACION, params=parametros, **opciones)
+        self.assertEqual(r.headers.get("cache-control"), "no-store")
+        return r
+
+    def consultar_comparacion(self, ids=(101, 102)):
+        contenido = self.ruta.read_bytes()
+        r = self.obtener_comparacion(ids)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.ruta.read_bytes(), contenido)
+        self.assertNotIn("PRIVADO", r.text)
+        datos = r.json()
+        self.comprobar_sin_estados_guardados(datos)
+        self.assertTrue({"ganador", "ranking", "exactitud"}.isdisjoint(datos))
+        self.assertEqual([x["pronostico_id"] for x in datos["resultados"]], list(ids))
+        self.assertEqual(datos["observaciones_evaluadas"] + len(datos["fechas_ausentes"]), 15)
+        for x in datos["resultados"]:
+            self.assertEqual(len(x["evaluacion"]["detalles"]), 15)
+            self.assertEqual(x["evaluacion"]["fechas_ausentes"], datos["fechas_ausentes"])
+        return datos
+
+    def comprobar_error_comparacion(self, respuesta, estado, codigo):
+        self.comprobar_error(respuesta, estado, codigo, errores=api.ERRORES_COMPARACION)
+
+    def test_comparacion_dos_pronosticos_orden_y_metricas_exactas(self):
+        self.preparar_comparacion()
+        esperado = comparaciones.comparar_evaluaciones(self.ruta, [102, 101])
+        r = self.consultar_comparacion([102, 101])
+        self.assertEqual(r, esperado)
+        self.assertEqual((r["estado_cobertura"], r["observaciones_evaluadas"], r["cobertura"]), ("completa", 15, 1))
+        self.assertEqual([tuple(x["evaluacion"][k] for k in ("mae", "wape", "rmse")) for x in r["resultados"]],
+                         [(0, 0, 0), (2, 10, sqrt(20 / 3))])
+
+    def test_comparacion_tres_pronosticos_conserva_orden(self):
+        self.preparar_comparacion(tres=True)
+        r = self.consultar_comparacion([103, 101, 102])
+        self.assertEqual([x["tecnica"] for x in r["resultados"]],
+                         ["hist_gradient_boosting", fixtures.BASE, "random_forest"])
+        self.assertEqual([x["evaluacion"]["mae"] for x in r["resultados"]], [2, 2, 0])
+
+    def test_comparacion_configuraciones_distintas_de_una_tecnica(self):
+        self.preparar_comparacion()
+        self.datos.crear_pronostico(103, 203, tecnica="random_forest", estimadas=[12, 16, 30] * 5)
+        self.datos.ejecutar('UPDATE experimento SET configuracion_json=\'{"parametros":{"n_estimators":100}}\' WHERE id=202')
+        self.datos.ejecutar('UPDATE experimento SET configuracion_json=\'{"parametros":{"n_estimators":200}}\' WHERE id=203')
+        with self.vigilar_sql():
+            r = self.consultar_comparacion([103, 102])
+        self.assertEqual([x["tecnica"] for x in r["resultados"]], ["random_forest", "random_forest"])
+        self.assertEqual([x["experimento_id"] for x in r["resultados"]], [203, 202])
+
+    def test_comparacion_parcial_con_fechas_ausentes_interiores(self):
+        self.preparar_comparacion()
+        faltan = (2, 8, 11)
+        for paso in faltan:
+            self.datos.ejecutar("DELETE FROM venta_diaria WHERE fecha=?", (fixtures.fecha_objetivo(fixtures.CORTES[0], paso),))
+        r = self.consultar_comparacion()
+        self.assertEqual((r["estado_cobertura"], r["observaciones_evaluadas"], r["cobertura"]), ("parcial", 12, 12 / 15))
+        self.assertEqual(r["alcance_metricas"], "Métricas sobre observaciones disponibles.")
+        self.assertEqual(r["fechas_ausentes"], [fixtures.fecha_objetivo(fixtures.CORTES[0], p) for p in faltan])
+        for x in r["resultados"]:
+            for paso in faltan:
+                self.assertIsNone(x["evaluacion"]["detalles"][paso - 1]["venta_real"])
+                self.assertIsNone(x["evaluacion"]["detalles"][paso - 1]["error_absoluto"])
+
+    def test_comparacion_sin_observaciones_con_metricas_null(self):
+        self.preparar_comparacion()
+        self.datos.ejecutar("DELETE FROM venta_diaria")
+        r = self.consultar_comparacion()
+        self.assertEqual((r["estado_cobertura"], r["observaciones_evaluadas"], r["cobertura"]), ("sin_observaciones", 0, 0))
+        for x in r["resultados"]:
+            self.assertEqual(tuple(x["evaluacion"][k] for k in ("mae", "wape", "rmse")), (None, None, None))
+        self.assertEqual(self.filas_guardadas(), [])
+
+    def test_comparacion_ventas_cero_y_wape_null(self):
+        self.preparar_comparacion()
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=0")
+        self.datos.ejecutar("UPDATE detalle_pronostico SET venta_estimada=CASE pronostico_id WHEN 101 THEN 2 ELSE 4 END")
+        r = self.consultar_comparacion()
+        self.assertEqual([tuple(x["evaluacion"][k] for k in ("mae", "wape", "rmse")) for x in r["resultados"]],
+                         [(2, None, 2), (4, None, 4)])
+
+    def test_comparacion_fracciones_y_wape_superior_a_cien(self):
+        self.preparar_comparacion()
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=0.25")
+        self.datos.ejecutar("UPDATE detalle_pronostico SET venta_estimada=CASE pronostico_id WHEN 101 THEN 0.75 ELSE 0.5 END")
+        r = self.consultar_comparacion()
+        self.assertEqual([tuple(x["evaluacion"][k] for k in ("mae", "wape", "rmse")) for x in r["resultados"]],
+                         [(0.5, 200, 0.5), (0.25, 100, 0.25)])
+
+    def test_comparacion_precision_sin_redondeo(self):
+        self.preparar_comparacion()
+        self.datos.ejecutar("DELETE FROM venta_diaria WHERE fecha>'2017-06-19'")
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=0")
+        self.datos.ejecutar("UPDATE detalle_pronostico SET venta_estimada=CASE WHEN paso=1 THEN 1 ELSE 0 END")
+        for x in self.consultar_comparacion()["resultados"]:
+            self.assertEqual((x["evaluacion"]["mae"], x["evaluacion"]["wape"], x["evaluacion"]["rmse"]),
+                             (1 / 3, None, sqrt(1 / 3)))
+
+    def test_comparacion_tres_cortes_autorizados_por_separado(self):
+        self.preparar_comparacion()
+        for i, corte in enumerate(fixtures.CORTES):
+            ids = [101 + 2 * i, 102 + 2 * i]
+            if i:
+                self.datos.crear_pronostico(ids[0], 201 + 2 * i, corte=corte)
+                self.datos.crear_pronostico(ids[1], 202 + 2 * i, corte=corte, tecnica="random_forest", estimadas=fixtures.REALES)
+                self.datos.insertar_reales(corte=corte)
+            with self.subTest(corte=corte):
+                r = self.consultar_comparacion(ids)
+                self.assertEqual(r["fecha_corte"], corte)
+                self.assertEqual([x["evaluacion"]["mae"] for x in r["resultados"]], [2, 0])
+
+    def test_comparacion_series_distintas_409_sin_resultados_parciales(self):
+        self.datos.crear_pronostico(102, 202, serie=84)
+        self.datos.insertar_reales(serie=84)
+        self.comprobar_error_comparacion(self.obtener_comparacion(), 409, "pronosticos_no_comparables")
+
+    def test_comparacion_cortes_distintos_409(self):
+        self.datos.crear_pronostico(102, 202, corte=fixtures.CORTES[1])
+        self.datos.insertar_reales(corte=fixtures.CORTES[1])
+        self.comprobar_error_comparacion(self.obtener_comparacion(), 409, "pronosticos_no_comparables")
+
+    def test_comparacion_inexistente_o_inactivo_404(self):
+        self.comprobar_error_comparacion(self.obtener_comparacion([101, 999]), 404, "pronostico_inexistente")
+        self.datos.crear_pronostico(102, 202, serie=24)
+        self.comprobar_error_comparacion(self.obtener_comparacion(), 404, "pronostico_inactivo")
+
+    def test_comparacion_sin_conjunto_activo_409(self):
+        self.preparar_comparacion()
+        self.datos.ejecutar("UPDATE conjunto_datos SET activo=0")
+        self.comprobar_error_comparacion(self.obtener_comparacion(), 409, "sin_conjunto_activo")
+
+    def test_comparacion_cantidad_y_duplicados_invalidos_antes_del_servicio(self):
+        with patch.object(api, "comparar_evaluaciones") as comparar, \
+                patch.object(sqlite3, "connect", side_effect=AssertionError("No abrir SQLite")):
+            for ids in ([], [101], [101, 102, 103, 104], [101] * 5, [101, 101], [101, 102, 101], ["00101", "101"]):
+                with self.subTest(ids=ids):
+                    self.comprobar_error_comparacion(self.obtener_comparacion(ids), 422, "entrada_invalida")
+            comparar.assert_not_called()
+
+    def test_comparacion_identificadores_invalidos_no_se_convierten(self):
+        with patch.object(api, "comparar_evaluaciones") as comparar:
+            for valor in ("", "0", "-1", "1.5", "101.0", "1e2", "true", "NaN", "Infinity", "+101", " 101", "101 ",
+                          "１２", "١", "0x65", "101,102", "[101,102]", str(MAX_ID + 1), "9" * 100):
+                with self.subTest(valor=valor):
+                    self.comprobar_error_comparacion(self.obtener_comparacion([101, valor]), 422, "pronostico_invalido")
+            comparar.assert_not_called()
+
+    def test_comparacion_maximo_sqlite_valido_no_se_trunca(self):
+        with patch.object(api, "comparar_evaluaciones", wraps=comparaciones.comparar_evaluaciones) as comparar:
+            self.comprobar_error_comparacion(self.obtener_comparacion([101, MAX_ID]), 404, "pronostico_inexistente")
+        comparar.assert_called_once_with(self.ruta, [101, MAX_ID])
+
+    def test_comparacion_parametros_adicionales_rechazados(self):
+        base = [("pronostico_id", "101"), ("pronostico_id", "102")]
+        with patch.object(api, "comparar_evaluaciones") as comparar:
+            for extra in (("otro", "PRIVADO"), ("fecha_corte", fixtures.CORTES[0]), ("pronostico_id[]", "103"), ("", "x")):
+                with self.subTest(extra=extra):
+                    self.comprobar_error_comparacion(self.obtener_comparacion(params=[*base, extra]), 422, "entrada_invalida")
+            comparar.assert_not_called()
+
+    def test_comparacion_cualquier_cuerpo_rechazado(self):
+        with patch.object(api, "comparar_evaluaciones") as comparar:
+            for cuerpo in (b"{}", b"[]", b"null", b" ", b"PRIVADO JSON malformado"):
+                with self.subTest(cuerpo=cuerpo):
+                    self.comprobar_error_comparacion(self.obtener_comparacion(content=cuerpo,
+                        headers={"Content-Type": "application/json"}), 422, "entrada_invalida")
+            comparar.assert_not_called()
+
+    def test_comparacion_tipo_o_corte_rechazados_antes_de_sus_ventas(self):
+        self.preparar_comparacion()
+        for tipo, corte, codigo in (("prueba", fixtures.CORTES[0], "tipo_no_evaluable"),
+                                    ("futuro", "2017-07-31", "tipo_no_evaluable"),
+                                    ("validacion", "2017-07-31", "corte_no_autorizado")):
+            self.datos.ejecutar("UPDATE pronostico SET tipo=?,fecha_corte=? WHERE id=102", (tipo, corte))
+            with self.subTest(tipo=tipo, corte=corte), self.vigilar_sql() as llamadas:
+                self.comprobar_error_comparacion(self.obtener_comparacion(), 422, codigo)
+            self.assertEqual([p for sql, p, _ in llamadas if "FROM venta_diaria" in sql],
+                             [(83, "2017-06-16", "2017-07-01")])
+
+    def test_comparacion_datos_o_detalles_corruptos_409(self):
+        self.preparar_comparacion()
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=-1 WHERE fecha='2017-06-17'")
+        self.comprobar_error_comparacion(self.obtener_comparacion(), 409, "datos_inconsistentes")
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=10 WHERE fecha='2017-06-17'")
+        self.datos.ejecutar("DELETE FROM detalle_pronostico WHERE pronostico_id=102 AND paso=8")
+        self.comprobar_error_comparacion(self.obtener_comparacion(), 409, "datos_inconsistentes")
+
+    def test_comparacion_base_inexistente_danada_o_sin_esquema_503(self):
+        ausente = self.ruta.parent / "PRIVADO_ausente.sqlite3"
+        app.dependency_overrides[obtener_ruta_base] = lambda: ausente
+        self.comprobar_error_comparacion(self.obtener_comparacion(), 503, "base_no_disponible")
+        self.assertFalse(ausente.exists())
+        for nombre, contenido in (("corrupta.sqlite3", b"Esto no es SQLite"), ("vacia.sqlite3", b"")):
+            ruta = self.ruta.parent / nombre
+            ruta.write_bytes(contenido)
+            app.dependency_overrides[obtener_ruta_base] = lambda: ruta
+            self.comprobar_error_comparacion(self.obtener_comparacion(), 503, "base_no_disponible")
+            self.assertEqual(ruta.read_bytes(), contenido)
+
+    def test_comparacion_errores_publicos_fijos_sin_filtraciones(self):
+        for codigo, estado in (("entrada_invalida", 422), ("pronostico_invalido", 422), ("tipo_no_evaluable", 422),
+                               ("corte_no_autorizado", 422), ("pronostico_inexistente", 404), ("pronostico_inactivo", 404),
+                               ("sin_conjunto_activo", 409), ("pronosticos_no_comparables", 409),
+                               ("datos_inconsistentes", 409), ("base_no_disponible", 503)):
+            error = comparaciones.ErrorComparacionEvaluaciones(codigo)
+            error.args = ("PRIVADO SELECT C:/secreto Traceback",)
+            with self.subTest(codigo=codigo), patch.object(api, "comparar_evaluaciones", side_effect=error):
+                self.comprobar_error_comparacion(self.obtener_comparacion(), estado, codigo)
+
+    def test_comparacion_codigos_desconocidos_y_errores_inesperados_500(self):
+        errores = [RuntimeError("PRIVADO"), sqlite3.OperationalError("PRIVADO SELECT"), OSError("PRIVADO ruta"),
+                   consulta.ErrorConsultaEvaluacion("base_no_disponible", "PRIVADO"),
+                   registro.ErrorRegistroEvaluacion("base_no_disponible", "PRIVADO")]
+        for codigo in ("PRIVADO codigo", None, [], {}):
+            error = comparaciones.ErrorComparacionEvaluaciones("datos_inconsistentes")
+            error.codigo = codigo
+            errores.append(error)
+        for error in errores:
+            with self.subTest(error=type(error).__name__), patch.object(api, "comparar_evaluaciones", side_effect=error):
+                self.comprobar_error_comparacion(self.obtener_comparacion(), 500, "error_interno")
+
+    def test_comparacion_error_inesperado_de_dependencia_500(self):
+        def fallar():
+            raise RuntimeError("PRIVADO ruta interna")
+
+        app.dependency_overrides[obtener_ruta_base] = fallar
+        with patch.object(api, "comparar_evaluaciones") as comparar:
+            self.comprobar_error_comparacion(self.obtener_comparacion(), 500, "error_interno")
+            comparar.assert_not_called()
+
+    def test_comparacion_delega_una_vez_en_d1_y_no_en_servicios_individuales(self):
+        self.preparar_comparacion()
+        with patch.object(api, "comparar_evaluaciones", wraps=comparaciones.comparar_evaluaciones) as comparar, \
+                patch.object(api, "consultar_evaluacion", side_effect=AssertionError("No GET individual")) as consultar, \
+                patch.object(api, "registrar_evaluacion", side_effect=AssertionError("No POST individual")) as guardar:
+            self.consultar_comparacion([102, 101])
+            comparar.assert_called_once_with(self.ruta, [102, 101])
+            consultar.assert_not_called()
+            guardar.assert_not_called()
+
+    def test_comparacion_sql_ro_begin_sin_dml_ni_lectura_privada_o_guardada(self):
+        self.preparar_comparacion(tres=True)
+        self.datos.ejecutar("INSERT INTO evaluacion VALUES (101,999999,NULL,NULL)")
+        guardada = self.filas_guardadas()
+        with self.vigilar_sql() as llamadas:
+            r = self.consultar_comparacion([103, 101, 102])
+        self.assertEqual(llamadas[0][:2], ("BEGIN", ()))
+        self.assertEqual(len(llamadas), 13)
+        self.assertTrue(all(en_transaccion for _, _, en_transaccion in llamadas[1:]))
+        self.assertFalse(any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) for s, _, _ in llamadas))
+        self.assertEqual(r["resultados"][1]["evaluacion"]["mae"], 2)
+        self.assertEqual(self.filas_guardadas(), guardada)
+
+    def test_comparacion_no_entrena_genera_ni_registra(self):
+        self.preparar_comparacion()
+        objetivos = ((api, "registrar_evaluacion"), (api, "consultar_evaluacion"), (generacion, "registrar_pronostico"),
+                     (generacion, "_calcular"), (modelos_prediccion, "entrenar_modelo"), (modelos_prediccion, "crear_estimador"),
+                     (modelos_prediccion, "pronosticar_recursivo"), (linea_base_prediccion, "pronosticar_serie"))
+        with ExitStack() as stack:
+            dobles = [stack.enter_context(patch.object(obj, nombre, side_effect=AssertionError(nombre)))
+                      for obj, nombre in objetivos]
+            self.consultar_comparacion()
+            for doble in dobles:
+                doble.assert_not_called()
+
+    def test_comparacion_pydantic_estricto_no_expone_campos_ajenos(self):
+        self.preparar_comparacion()
+        valido = comparaciones.comparar_evaluaciones(self.ruta, [101, 102])
+        casos = [{**deepcopy(valido), campo: "PRIVADO"} for campo in
+                 ("ganador", "ranking", "exactitud", "registrado", "vigente", "PRIVADO")]
+        casos.append({**deepcopy(valido), "observaciones_evaluadas": "15"})
+        for cantidad in (1, 4):
+            casos.append({**deepcopy(valido), "resultados": [deepcopy(valido["resultados"][0])] * cantidad})
+        anidado = deepcopy(valido)
+        anidado["resultados"][0]["evaluacion"]["mae"] = "2"
+        casos.append(anidado)
+        for i, invalido in enumerate(casos):
+            with self.subTest(caso=i), patch.object(api, "comparar_evaluaciones", return_value=invalido):
+                self.comprobar_error_comparacion(self.obtener_comparacion(), 500, "error_interno")
+
+    def test_comparacion_openapi_parametro_repetido_modelos_y_errores(self):
+        esquema = self.cliente.get("/openapi.json").json()
+        ruta = esquema["paths"][RUTA_COMPARACION]
+        self.assertEqual(set(ruta), {"get"})
+        operacion = ruta["get"]
+        self.assertNotIn("requestBody", operacion)
+        self.assertEqual(len(operacion["parameters"]), 1)
+        parametro = operacion["parameters"][0]
+        self.assertEqual((parametro["name"], parametro["in"], parametro["required"]), ("pronostico_id", "query", True))
+        entrada = parametro["schema"]
+        self.assertEqual((entrada["type"], entrada["minItems"], entrada["maxItems"], entrada["uniqueItems"]), ("array", 2, 3, True))
+        self.assertEqual((entrada["items"]["type"], entrada["items"]["exclusiveMinimum"], entrada["items"]["maximum"]),
+                         ("integer", 0, MAX_ID))
+        self.assertIn("ASCII", parametro["description"])
+        self.assertEqual(set(operacion["responses"]), {"200", "422", "404", "409", "503", "500"})
+        self.assertIn("pronosticos_no_comparables", operacion["responses"]["409"]["description"])
+        schemas = esquema["components"]["schemas"]
+        ref = operacion["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        modelo = schemas[ref.rsplit("/", 1)[-1]]
+        self.assertEqual(set(modelo["properties"]), {"conjunto_id", "serie", "fecha_corte", "horizonte", "estado_cobertura",
+            "alcance_metricas", "observaciones_evaluadas", "cobertura", "fechas_ausentes", "resultados"})
+        self.assertFalse(modelo["additionalProperties"])
+        self.assertEqual(modelo["properties"]["serie"]["$ref"], "#/components/schemas/SerieEvaluacion")
+        resultados = modelo["properties"]["resultados"]
+        self.assertEqual((resultados["minItems"], resultados["maxItems"]), (2, 3))
+        resultado = schemas[resultados["items"]["$ref"].rsplit("/", 1)[-1]]
+        self.assertEqual(set(resultado["properties"]), {"pronostico_id", "experimento_id", "tecnica", "evaluacion"})
+        self.assertEqual(resultado["properties"]["evaluacion"]["$ref"], "#/components/schemas/MetricasEvaluacion")
+        for contenido in operacion["responses"].values():
+            self.assertEqual(contenido["headers"]["Cache-Control"]["schema"]["const"], "no-store")
+
+    def test_comparacion_excepcion_query_aislada_de_get_y_post_individuales(self):
+        self.preparar_comparacion()
+        with patch.object(api, "comparar_evaluaciones", wraps=comparaciones.comparar_evaluaciones) as comparar, \
+                patch.object(api, "consultar_evaluacion", wraps=consulta.consultar_evaluacion) as consultar, \
+                patch.object(api, "registrar_evaluacion", wraps=registro.registrar_evaluacion) as guardar:
+            self.consultar_comparacion()
+            individual = self.consultar()
+            self.assertNotIn("resultados", individual)
+            self.assertEqual(self.guardar().status_code, 201)
+            parametros = [("pronostico_id", "101"), ("pronostico_id", "102")]
+            self.comprobar_error(self.obtener(params=parametros), 422, "entrada_invalida")
+            self.comprobar_error_post(self.guardar(params=parametros), 422, "entrada_invalida")
+            comparar.assert_called_once_with(self.ruta, [101, 102])
+            consultar.assert_called_once_with(self.ruta, 101)
+            guardar.assert_called_once_with(self.ruta, 101)
+
+    def test_comparacion_importacion_arranque_y_openapi_no_ejecutan_servicios(self):
+        codigo = compile(Path(api.__file__).read_text(encoding="utf-8"), api.__file__, "exec")
+        aislado = ModuleType("api_evaluaciones_d2_en_prueba")
+        with patch.dict(sys.modules, {aislado.__name__: aislado}), \
+                patch.object(comparaciones, "comparar_evaluaciones", side_effect=AssertionError("No comparar")) as comparar, \
+                patch.object(registro, "registrar_evaluacion", side_effect=AssertionError("No registrar")) as guardar, \
+                patch.object(consulta, "consultar_evaluacion", side_effect=AssertionError("No consultar")) as consultar, \
+                patch.object(sqlite3, "connect", side_effect=AssertionError("No abrir SQLite")):
+            exec(codigo, aislado.__dict__)
+            aplicacion = FastAPI()
+            aplicacion.include_router(aislado.router)
+            with TestClient(aplicacion) as cliente:
+                self.assertEqual(cliente.get("/openapi.json").status_code, 200)
+            for doble in (comparar, guardar, consultar):
+                doble.assert_not_called()
+
+    def test_comparacion_recalcula_ventas_actuales_sin_tocar_fila_guardada(self):
+        self.preparar_comparacion()
+        registro.registrar_evaluacion(self.ruta, 101)
+        guardada = self.filas_guardadas()
+        self.datos.ejecutar("UPDATE venta_diaria SET sales=11 WHERE fecha='2017-06-17'")
+        with self.vigilar_sql():
+            r = self.consultar_comparacion()
+        self.assertEqual(r["resultados"][0]["evaluacion"]["mae"], 31 / 15)
+        self.assertEqual(r["resultados"][1]["evaluacion"]["mae"], 1 / 15)
+        self.assertEqual(self.filas_guardadas(), guardada)
 
 
 if __name__ == "__main__":
