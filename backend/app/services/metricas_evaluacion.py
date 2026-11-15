@@ -7,12 +7,14 @@ script para mantener este núcleo independiente de pandas y del acceso a datos.
 
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
-from math import fsum, isfinite, sqrt
+from math import fsum, isfinite, nextafter, sqrt
 from numbers import Real
 
 
 HORIZONTE_DIAS = 15
 CORTES_AUTORIZADOS = (date(2017, 6, 16), date(2017, 7, 1), date(2017, 7, 16))
+_RAZON_MINIMO_FLOAT = nextafter(0.0, 1.0).as_integer_ratio()
+_RAZON_MAXIMO_FLOAT = nextafter(float("inf"), 0.0).as_integer_ratio()
 
 
 class ErrorMetricasEvaluacion(ValueError):
@@ -58,6 +60,32 @@ def _filas(filas, campos: tuple[str, ...], nombre: str) -> None:
                 "estructura_invalida", f"Cada fila de {nombre} debe contener {', '.join(campos)}.")
 
 
+def _wape_estable(suma_errores: float, suma_reales: float) -> float | None:
+    """Calcula el porcentaje de dos sumas float sin intermediarios float.
+
+    as_integer_ratio conserva exactamente sus valores binarios. Los productos
+    y la comparación de límites usan enteros de precisión arbitraria; solo la
+    división final produce un float, con su redondeo natural. No se usa Decimal
+    ni se alteran las acumulaciones. Un positivo fuera del intervalo entre el
+    menor float positivo (incluidos subnormales) y el máximo finito se rechaza,
+    aunque redondearlo al extremo pudiera ocultar esa salida de rango.
+    """
+    if suma_reales == 0:
+        return None
+    if suma_errores == 0:
+        return 0.0
+    error_num, error_den = suma_errores.as_integer_ratio()
+    real_num, real_den = suma_reales.as_integer_ratio()
+    numerador = 100 * error_num * real_den
+    denominador = error_den * real_num
+    minimo_num, minimo_den = _RAZON_MINIMO_FLOAT
+    maximo_num, maximo_den = _RAZON_MAXIMO_FLOAT
+    if (numerador * minimo_den < denominador * minimo_num
+            or numerador * maximo_den > denominador * maximo_num):
+        raise ValueError("WAPE positivo fuera del rango float finito.")
+    return numerador / denominador
+
+
 def calcular_metricas(
     fecha_corte: date | str,
     detalles: Sequence[Mapping],
@@ -75,6 +103,9 @@ def calcular_metricas(
     MAE = fsum(errores absolutos) / observaciones_evaluadas.
     WAPE = 100 * fsum(errores absolutos) / fsum(abs(sales)), en porcentaje;
     no representa exactitud y puede superar 100.
+    El porcentaje se calcula con razones binarias exactas de las sumas y una
+    sola conversión final a float, sin desbordamientos intermedios. Un WAPE
+    positivo fuera del intervalo float finito representable se rechaza.
     RMSE = sqrt(media de errores al cuadrado), en las mismas fechas observadas.
     Se normalizan los errores por su máximo antes de elevarlos al cuadrado
     y se restituye esa escala después de la raíz, evitando desbordamientos.
@@ -137,8 +168,7 @@ def calcular_metricas(
             suma_errores = fsum(errores)
             suma_reales = fsum(abs(valor) for valor in reales.values())
             mae = suma_errores / cantidad
-            # Dividir primero evita desbordar al multiplicar la suma por 100.
-            wape = (suma_errores / suma_reales) * 100 if suma_reales else None
+            wape = _wape_estable(suma_errores, suma_reales)
             escala = max(errores)
             rmse = (escala * sqrt(fsum((error / escala) ** 2 for error in errores) / cantidad)
                     if escala else 0.0)
