@@ -836,3 +836,43 @@
   .evaluation-actions button { width: 100%; }
   .evaluation-scroll th, .evaluation-scroll td { padding: 8px; }
 }
+
+/* HU005-E2-C: controles y tablas de consolidación; D3 conserva sus estilos. */
+.consolidation-modes { display: flex; flex-wrap: wrap; gap: 12px; margin: 20px 0; }
+.consolidation-modes button { flex: 1 1 260px; text-align: left; }
+.consolidation-modes button[aria-pressed='true'] { border: 2px solid var(--accent); font-weight: 700; }
+.consolidation-panel { min-width: 0; }
+.consolidation-count { display: grid; gap: 8px; max-width: 320px; margin: 20px 0; font-weight: 600; }
+.consolidation-count select, .consolidation-slot select {
+  min-width: 0; width: 100%; box-sizing: border-box; padding: 10px;
+  border: 1px solid var(--accent-border); border-radius: 7px;
+  background: var(--bg); color: var(--text-h); font: inherit;
+}
+.consolidation-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 16px; margin: 20px 0; }
+.consolidation-group { min-width: 0; margin: 0; padding: 14px; border: 1px solid var(--border); border-radius: 8px; }
+.consolidation-group legend { padding: 0 8px; font-weight: 700; }
+.consolidation-slot { display: grid; gap: 9px; padding: 12px 0; }
+.consolidation-slot + .consolidation-slot { border-top: 1px solid var(--border); }
+.consolidation-slot label { font-weight: 600; }
+.consolidation-slot button { text-align: left; }
+.consolidation-selection { font-size: 0.85rem; margin: 0; }
+.consolidation-candidates { padding-left: 22px; }
+.consolidation-candidates li + li { margin-top: 8px; }
+.consolidation-feedback { padding-left: 14px; border-left: 3px solid var(--accent-border); }
+.consolidation-results, .consolidation-preview { margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--border); }
+.consolidation-details { margin: 18px 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; }
+.consolidation-details > summary { cursor: pointer; padding: 6px 0; font-weight: 600; }
+.consolidation-details[open] > summary { margin-bottom: 16px; }
+.consolidation-identity { display: block; overflow-wrap: anywhere; font-size: 0.85rem; margin-top: 8px; }
+.consolidation-configuration dt, .consolidation-details dt { font-weight: 600; }
+.consolidation-configuration dd, .consolidation-details dd { margin-left: 0; margin-bottom: 10px; }
+.consolidation-configuration ol { display: flex; flex-wrap: wrap; gap: 8px 28px; padding-left: 26px; }
+.consolidation-scroll th[scope='row'] { min-width: 180px; }
+.consolidation-scroll td.consolidation-dates { white-space: normal; min-width: 180px; }
+.consolidation-dates { overflow-wrap: anywhere; }
+@media (max-width: 650px) {
+  .consolidation-groups { grid-template-columns: minmax(0, 1fr); }
+  .consolidation-modes { flex-direction: column; }
+  .consolidation-modes button { flex-basis: auto; }
+  .consolidation-slot button, .consolidation-count { width: 100%; max-width: none; }
+}

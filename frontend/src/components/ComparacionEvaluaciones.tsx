@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import type { SerieTemporal, SeriesState } from './SelectorSerie'
+import ConsolidacionEvaluaciones from './ConsolidacionEvaluaciones'
 
 type Seleccion = { conjuntoId: number; serie: SerieTemporal }
 type Props = { seleccion: Seleccion | null; activo: boolean; estadoConjunto: SeriesState['kind'] }
@@ -385,11 +386,24 @@ export default function ComparacionEvaluaciones({ seleccion, activo, estadoConju
   // App asigna una key por conjunto y serie: un cambio de contexto descarta
   // también esta elección. Al salir solo se desmonta el panel de solicitudes.
   const [eleccion, setEleccion] = useState<Eleccion>({ corte: CORTES[0], opciones: [] })
+  const [modalidad, setModalidad] = useState<'corte' | 'consolidada'>('corte')
+  const idModalidad = useId()
   if (!activo) return null
   return <section className="evaluation-card" aria-label="Comparación cuantitativa">
     <h2>Comparación de evaluaciones</h2>
+    <div className="consolidation-modes" role="group" aria-label="Modalidad de comparación">
+      <button type="button" aria-pressed={modalidad === 'corte'} aria-controls={`${idModalidad}-panel`}
+        onClick={() => setModalidad('corte')}>Por corte — 15 días</button>
+      <button type="button" aria-pressed={modalidad === 'consolidada'} aria-controls={`${idModalidad}-panel`}
+        onClick={() => setModalidad('consolidada')}>Consolidada — tres cortes / hasta 45 observaciones</button>
+    </div>
+    <div id={`${idModalidad}-panel`}>
     {!seleccion ? <p>{estadoConjunto === 'no-active' ? 'No hay un conjunto activo para comparar.' :
       'Seleccione una tienda y una familia del conjunto activo para consultar sus pronósticos.'}</p> :
-      <PanelComparacion seleccion={seleccion} eleccion={eleccion} setEleccion={setEleccion} />}
+      modalidad === 'corte' ? <PanelComparacion seleccion={seleccion} eleccion={eleccion} setEleccion={setEleccion} /> :
+        <ConsolidacionEvaluaciones
+          key={`${seleccion.conjuntoId}:${seleccion.serie.id}:${seleccion.serie.store_nbr}:${seleccion.serie.family}`}
+          seleccion={seleccion} />}
+    </div>
   </section>
 }
