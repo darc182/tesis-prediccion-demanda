@@ -63,10 +63,16 @@ type Metadatos = {
   inicio_entrenamiento: string; fin_entrenamiento: string
   duracion_segundos?: number | null
 }
+
+type MetadatosListado = Omit<Metadatos, 'fecha_corte' | 'tipo'> & {
+  fecha_corte: string
+  tipo: 'validacion' | 'prueba' | 'futuro'
+}
 type Referencia = Pick<Metadatos, 'id' | 'experimento_id' | 'tecnica' | 'fecha_corte'>
 type Fila = { paso: number; fecha_objetivo: string; venta_estimada: number }
 type RespuestaDetalle = { conjunto_id: number; serie: SerieTemporal; pronostico: Metadatos; detalles: Fila[] }
-type EstadoLista = { kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'success'; filas: Metadatos[] }
+type EstadoLista = { kind: 'loading' } | { kind: 'error'; message: string } |
+  { kind: 'success'; filas: Metadatos[]; total: number }
 type EstadoDetalle = { kind: 'idle' } | { kind: 'loading'; id: number } |
   { kind: 'error'; message: string } | { kind: 'success'; data: RespuestaDetalle }
 type EstadoComparacion = { kind: 'idle' } | { kind: 'loading' } |
@@ -339,6 +345,31 @@ function esDisponibilidad(value: unknown, seleccion: Seleccion, corte: Corte, gr
   return motivos.every(n => n <= filasDescartadas) && descartes.dia_semana === 0 && descartes.mes === 0 &&
     motivos.reduce((suma, n) => suma + n, 0) >= filasDescartadas
 }
+function fechaListadoValida(value: unknown): value is string {
+  return typeof value === 'string' && value >= '0001-01-01' && instanteFecha(value) !== null
+}
+function generacionListadoValida(value: unknown): value is string {
+  if (typeof value !== 'string' || !fechaListadoValida(value.slice(0, 10))) return false
+  const hora = /^(?:[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.[0-9]+)?)?(?:Z|[+-]([0-9]{2}):([0-9]{2}))?)?$/.exec(value.slice(10))
+  return hora !== null && hora.slice(1).every((parte, i) =>
+    parte === undefined || Number(parte) < (i === 0 || i === 3 ? 24 : 60)) && Number.isFinite(Date.parse(value))
+}
+function esMetadatoListado(value: unknown): value is MetadatosListado {
+  if (!registro(value)) return false
+  // El contrato actual del backend exige quince días para los tres tipos.
+  return idValido(value.id) && idValido(value.experimento_id) && esTecnica(value.tecnica) &&
+    (value.tipo === 'validacion' || value.tipo === 'prueba' || value.tipo === 'futuro') &&
+    fechaListadoValida(value.fecha_corte) && value.horizonte === 15 &&
+    (value.duracion_segundos == null || duracionValida(value.duracion_segundos)) &&
+    generacionListadoValida(value.fecha_generacion) &&
+    fechaListadoValida(value.inicio_entrenamiento) && fechaListadoValida(value.fin_entrenamiento) &&
+    value.inicio_entrenamiento <= value.fin_entrenamiento && value.fin_entrenamiento <= value.fecha_corte
+}
+function esElegibleEnListado(value: MetadatosListado): value is Metadatos {
+  return value.tipo === 'validacion' && value.horizonte === 15 && esCorte(value.fecha_corte)
+}
+
+// El GET de detalle conserva sus validaciones de pronósticos de validación.
 function esMetadato(value: unknown): value is Metadatos {
   if (!registro(value)) return false
   return idValido(value.id) && idValido(value.experimento_id) && esTecnica(value.tecnica) &&
@@ -696,17 +727,17 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
       if (!vivo.current || controller.signal.aborted) return
       const contexto = { conjuntoId, serie: { id: serieId, store_nbr: tienda, family: familia } }
       if (!registro(body) || !mismaSeleccion(body, contexto) || !Array.isArray(body.pronosticos) ||
-          !body.pronosticos.every(esMetadato) ||
+          !body.pronosticos.every(esMetadatoListado) ||
           new Set(body.pronosticos.map(p => p.id)).size !== body.pronosticos.length) {
         throw new ErrorSolicitud('El listado recibido no corresponde a la serie y conjunto seleccionados o contiene datos inválidos.')
       }
-      const filas = body.pronosticos
+      const filas = body.pronosticos.filter(esElegibleEnListado)
       setSeleccionComparacion(anterior => anterior.flatMap(p => {
         const vigente = filas.find(fila => fila.id === p.id && fila.experimento_id === p.experimento_id &&
           fila.tecnica === p.tecnica && fila.fecha_corte === p.fecha_corte)
         return vigente ? [vigente] : []
       }))
-      setLista({ kind: 'success', filas })
+      setLista({ kind: 'success', filas, total: body.pronosticos.length })
     } catch (error) {
       if (vivo.current && !controller.signal.aborted) setLista({ kind: 'error', message:
         mensajeError(error, 'No se pudo conectar para consultar los pronósticos almacenados.') })
@@ -1114,7 +1145,8 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
         {lista.kind === 'loading' && <p role="status">Cargando pronósticos almacenados…</p>}
         {lista.kind === 'error' && <p className="forecast-message forecast-message--error" role="alert">{lista.message}</p>}
         {lista.kind === 'success' && (lista.filas.length === 0
-          ? <p role="status">No hay pronósticos almacenados para esta serie.</p>
+          ? <p role="status">{lista.total === 0 ? 'No hay pronósticos almacenados para esta serie.'
+            : 'Hay pronósticos almacenados, pero no hay pronósticos de validación elegibles en los tres cortes autorizados.'}</p>
           : filasFiltradas.length === 0 ? <p role="status">No hay pronósticos que coincidan con los filtros seleccionados.</p>
           : <div className="forecast-table-wrap" tabIndex={0} role="region" aria-label="Listado de pronósticos">
             <table>
