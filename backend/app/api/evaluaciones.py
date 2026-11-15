@@ -11,6 +11,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from backend.app.api.datasets import obtener_ruta_base
 from backend.app.services.comparacion_evaluaciones import ErrorComparacionEvaluaciones, comparar_evaluaciones
+from backend.app.services.consolidacion_evaluaciones import ErrorConsolidacionEvaluaciones, consolidar_evaluaciones
 from backend.app.services.consulta_evaluaciones import ErrorConsultaEvaluacion, consultar_evaluacion
 from backend.app.services.registro_evaluaciones import ErrorRegistroEvaluacion, registrar_evaluacion
 from backend.app.services.validacion_csv import MAX_ENTERO_SQLITE
@@ -48,8 +49,22 @@ ERRORES_COMPARACION = {
 }
 
 
-def _respuesta_error(codigo, *, registro=False, comparacion=False):
-    errores = ERRORES_COMPARACION if comparacion else ERRORES_REGISTRO if registro else ERRORES
+ERRORES_CONSOLIDACION = {
+    **ERRORES,
+    "entrada_invalida": (422, "Indique únicamente dos o tres parámetros grupo, cada uno con tres IDs distintos separados por comas, sin cuerpo."),
+    "pronostico_invalido": (422, "Cada ID del grupo debe ser un entero decimal ASCII positivo dentro del límite SQLite."),
+    "configuraciones_no_equivalentes": (409, "Los tres pronósticos de un grupo no comparten identidad predictiva."),
+    "configuraciones_duplicadas": (409, "Los grupos deben representar configuraciones predictivas diferentes."),
+    "versiones_incompatibles": (409, "Las versiones de ejecución de un grupo son incompatibles o no acreditables."),
+    "pronosticos_no_comparables": (409, "Los pronósticos no comparten conjunto, serie, cortes ordenados y observaciones reales."),
+    "resultado_no_finito": (409, "Las sumas o métricas consolidadas exceden el rango numérico representable."),
+    "error_interno": (500, "No se pudo completar la consolidación temporal de evaluaciones."),
+}
+
+
+def _respuesta_error(codigo, *, registro=False, comparacion=False, consolidacion=False):
+    errores = (ERRORES_CONSOLIDACION if consolidacion else ERRORES_COMPARACION if comparacion
+               else ERRORES_REGISTRO if registro else ERRORES)
     if type(codigo) is not str or codigo not in errores:
         codigo = "error_interno"
     estado, mensaje = errores[codigo]
@@ -63,34 +78,42 @@ class RutaEvaluaciones(APIRoute):
         original = super().get_route_handler()
         es_registro = "POST" in self.methods
         es_comparacion = self.name == "comparacion_actual"
+        es_consolidacion = self.name == "consolidacion_actual"
+        opciones_error = {"registro": es_registro, "comparacion": es_comparacion, "consolidacion": es_consolidacion}
 
         async def manejar(request: Request):
             try:
-                if es_comparacion:
+                if es_consolidacion:
+                    query_invalida = bool(set(request.query_params) - {"grupo"})
+                elif es_comparacion:
                     query_invalida = bool(set(request.query_params) - {"pronostico_id"})
                 else:
                     query_invalida = bool(request.query_params)
                 if query_invalida or await request.body():
-                    respuesta = _respuesta_error("entrada_invalida", registro=es_registro, comparacion=es_comparacion)
+                    respuesta = _respuesta_error("entrada_invalida", **opciones_error)
                 else:
                     respuesta = await original(request)
             except RequestValidationError as error:
                 codigo = "pronostico_invalido"
-                if es_comparacion and not any(e["loc"][:2] == ("query", "pronostico_id") and len(e["loc"]) > 2
-                                             for e in error.errors()):
+                if es_consolidacion or (es_comparacion and not any(
+                    e["loc"][:2] == ("query", "pronostico_id") and len(e["loc"]) > 2 for e in error.errors()
+                )):
                     codigo = "entrada_invalida"
-                respuesta = _respuesta_error(codigo, registro=es_registro, comparacion=es_comparacion)
+                respuesta = _respuesta_error(codigo, **opciones_error)
             except ErrorConsultaEvaluacion as error:
-                respuesta = _respuesta_error("error_interno" if es_comparacion else error.codigo,
-                                             registro=es_registro, comparacion=es_comparacion)
+                respuesta = _respuesta_error("error_interno" if es_comparacion or es_consolidacion else error.codigo,
+                                             **opciones_error)
             except ErrorRegistroEvaluacion as error:
                 respuesta = _respuesta_error(error.codigo if es_registro else "error_interno",
-                                             registro=es_registro, comparacion=es_comparacion)
+                                             **opciones_error)
             except ErrorComparacionEvaluaciones as error:
                 respuesta = _respuesta_error(error.codigo if es_comparacion else "error_interno",
-                                             registro=es_registro, comparacion=es_comparacion)
+                                             **opciones_error)
+            except ErrorConsolidacionEvaluaciones as error:
+                respuesta = _respuesta_error(error.codigo if es_consolidacion else "error_interno",
+                                             **opciones_error)
             except Exception:
-                respuesta = _respuesta_error("error_interno", registro=es_registro, comparacion=es_comparacion)
+                respuesta = _respuesta_error("error_interno", **opciones_error)
             respuesta.headers["Cache-Control"] = "no-store"
             return respuesta
 
@@ -170,6 +193,74 @@ class ComparacionEvaluaciones(ModeloEvaluaciones):
     resultados: list[ResultadoComparacion] = Field(min_length=2, max_length=3)
 
 
+class ConfiguracionConsolidacion(ModeloEvaluaciones):
+    version_contrato: int = Field(ge=1)
+    tecnica: Literal["estacional_semanal_recursiva", "random_forest", "hist_gradient_boosting"]
+    parametros: dict[str, int | float | bool | str | None] = Field(
+        description="Parámetros completos F2; conserva números, booleanos, cadenas y null con sus tipos JSON.")
+    variables: list[str]
+    horizonte: Literal[15]
+    version_reglas: int = Field(ge=1)
+
+
+class VersionesBaseConsolidacion(ModeloEvaluaciones):
+    python: str
+    pandas: str
+
+
+class VersionesRegresorConsolidacion(VersionesBaseConsolidacion):
+    scikit_learn: str
+
+
+class RMSEEscaladoConsolidacion(ModeloEvaluaciones):
+    escala_errores: float = Field(ge=0)
+    suma_cuadrados_normalizados: float = Field(ge=0, le=45)
+
+
+class MetricasConsolidadas(ModeloEvaluaciones):
+    mae: float | None = Field(ge=0)
+    wape: float | None = Field(ge=0, description="Porcentaje global; no se promedian los WAPE por corte.")
+    rmse: float | None = Field(ge=0)
+    suma_errores_absolutos: float = Field(ge=0)
+    suma_ventas_reales: float = Field(ge=0)
+    observaciones_evaluadas: int = Field(ge=0, le=45)
+    fechas_sin_registro: int = Field(ge=0, le=45)
+    cobertura: float = Field(ge=0, le=1)
+    definicion_cobertura: str
+    estado_cobertura: Literal["completa", "parcial", "sin_observaciones"]
+    alcance_metricas: str
+    rmse_escalado: RMSEEscaladoConsolidacion = Field(
+        description="RMSE = escala_errores * sqrt(suma_cuadrados_normalizados / observaciones_evaluadas), si hay pares.")
+
+
+class AusenciasCorteConsolidacion(ModeloEvaluaciones):
+    fecha_corte: Literal["2017-06-16", "2017-07-01", "2017-07-16"]
+    fechas_ausentes: list[str] = Field(max_length=15)
+
+
+class ResultadoConsolidacion(ModeloEvaluaciones):
+    tecnica: Literal["estacional_semanal_recursiva", "random_forest", "hist_gradient_boosting"]
+    identidad_configuracion: str = Field(pattern=r"^[0-9a-f]{64}$", description="Identidad predictiva SHA256 de F2.")
+    configuracion: ConfiguracionConsolidacion
+    versiones_ejecucion: VersionesBaseConsolidacion | VersionesRegresorConsolidacion
+    evaluaciones: list[ConsultaEvaluacion] = Field(min_length=3, max_length=3)
+    consolidado: MetricasConsolidadas
+
+
+class ConsolidacionEvaluaciones(ModeloEvaluaciones):
+    conjunto_id: int = Field(gt=0)
+    serie: SerieEvaluacion
+    cortes: list[Literal["2017-06-16", "2017-07-01", "2017-07-16"]] = Field(min_length=3, max_length=3)
+    horizonte_por_corte: Literal[15]
+    fechas_esperadas_total: Literal[45]
+    observaciones_evaluadas_total: int = Field(ge=0, le=45)
+    cobertura_total: float = Field(ge=0, le=1)
+    estado_cobertura: Literal["completa", "parcial", "sin_observaciones"]
+    alcance_metricas: str
+    fechas_ausentes_por_corte: list[AusenciasCorteConsolidacion] = Field(min_length=3, max_length=3)
+    resultados: list[ResultadoConsolidacion] = Field(min_length=2, max_length=3)
+
+
 class DetalleErrorEvaluacion(ModeloEvaluaciones):
     codigo: str
     mensaje: str
@@ -222,7 +313,69 @@ RESPUESTAS_COMPARACION = {
 }
 
 
+RESPUESTAS_CONSOLIDACION = {
+    200: {"description": "Consolidado actual de dos o tres configuraciones sobre tres cortes; sin escrituras.",
+          "headers": CABECERA_CACHE},
+    **{estado: {"model": ErrorEvaluacion, "description": descripcion, "headers": CABECERA_CACHE}
+       for estado, descripcion in (
+           (422, "entrada_invalida, pronostico_invalido, tipo_no_evaluable o corte_no_autorizado."),
+           (404, "pronostico_inexistente o pronostico_inactivo."),
+           (409, "sin_conjunto_activo, configuraciones_no_equivalentes, configuraciones_duplicadas, "
+                 "versiones_incompatibles, pronosticos_no_comparables, datos_inconsistentes o resultado_no_finito."),
+           (503, "base_no_disponible."), (500, "error_interno; mensaje público genérico."))},
+}
+
+
 router = APIRouter(prefix="/api/evaluaciones", tags=["evaluaciones"], route_class=RutaEvaluaciones)
+
+
+@router.get("/consolidacion/active", response_model=ConsolidacionEvaluaciones, responses=RESPUESTAS_CONSOLIDACION,
+            summary="Consolidar evaluaciones actuales de dos o tres configuraciones sobre tres cortes")
+def consolidacion_actual(
+    grupo: Annotated[list[str], Query(
+        min_length=2, max_length=3,
+        description="Repita grupo dos o tres veces. Cada valor contiene tres IDs ASCII positivos separados solo por "
+                    "comas, en orden de cortes 2017-06-16, 2017-07-01, 2017-07-16. Sin espacios ni IDs repetidos "
+                    f"entre grupos. Cada ID no supera {MAX_ENTERO_SQLITE}. Se conserva el orden solicitado.",
+        examples=[["101,102,103", "201,202,203"], ["101,102,103", "201,202,203", "301,302,303"]])],
+    ruta_base: Path = Depends(obtener_ruta_base),
+):
+    """Delega exactamente una llamada a consolidar_evaluaciones(ruta_base, grupos).
+
+    Solo admite grupo repetido dos o tres veces, sin cuerpo ni parámetros
+    adicionales. Los seis o nueve IDs son enteros decimales ASCII positivos,
+    distintos y dentro del límite SQLite. Cada grupo sigue los tres cortes en
+    orden; el servicio verifica identidad, versiones y observaciones equivalentes.
+
+    E2-A calcula en una única instantánea SQLite de solo lectura; no utiliza la
+    tabla evaluacion almacenada. No registra, entrena, genera ni selecciona
+    ganadores. La cobertura consolidada usa las 45 fechas esperadas. Con cobertura
+    parcial las métricas solo describen las observaciones disponibles. Sin reales
+    las tres métricas son null; con suma real cero WAPE es null. No se redondean
+    números ni se promedian porcentajes WAPE por corte. Las versiones de ejecución
+    acreditadas se conservan por grupo, sin inventar scikit_learn para la línea base.
+    Éxitos y errores gestionados incluyen Cache-Control: no-store.
+    """
+    grupos = []
+    limite = str(MAX_ENTERO_SQLITE)
+    for valor in grupo:
+        partes = valor.split(",")
+        if len(partes) != 3:
+            return _respuesta_error("entrada_invalida", consolidacion=True)
+        ids = []
+        for parte in partes:
+            # Comprobar el rango como texto evita convertir enteros arbitrariamente
+            # largos; los ceros iniciales válidos no alteran identidad ni duplicados.
+            numero = parte.lstrip("0")
+            if (not parte.isascii() or not parte.isdecimal() or not numero
+                    or len(numero) > len(limite) or (len(numero) == len(limite) and numero > limite)):
+                return _respuesta_error("pronostico_invalido", consolidacion=True)
+            ids.append(int(numero))
+        grupos.append(ids)
+    seleccion = [i for ids in grupos for i in ids]
+    if len(set(seleccion)) != len(seleccion):
+        return _respuesta_error("entrada_invalida", consolidacion=True)
+    return ConsolidacionEvaluaciones.model_validate(consolidar_evaluaciones(ruta_base, grupos))
 
 
 @router.get("/comparacion/active", response_model=ComparacionEvaluaciones, responses=RESPUESTAS_COMPARACION,
