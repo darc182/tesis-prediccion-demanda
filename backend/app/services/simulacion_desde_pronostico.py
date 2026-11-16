@@ -56,6 +56,45 @@ def _cabecera(conexion, identificador, conjunto):
     return fila
 
 
+def _validar_identificador(pronostico_id):
+    """Valida antes de abrir cualquier conexión; compartido con comparación."""
+    if type(pronostico_id) is not int or not 0 < pronostico_id <= 2**63 - 1:
+        raise ErrorSimulacionDesdePronostico("pronostico_invalido")
+
+
+def _normalizar_ruta(ruta_base):
+    """Normaliza solo la ruta explícita, conservando el rechazo público S4-A2."""
+    try:
+        if not isinstance(ruta_base, (str, Path)) or not str(ruta_base) or "\0" in str(ruta_base):
+            raise ValueError("Ruta inválida")
+        ruta = Path(ruta_base).resolve()
+    except (TypeError, ValueError, OSError, RuntimeError) as error:
+        raise ErrorSimulacionDesdePronostico("base_no_disponible") from error
+    return ruta
+
+
+def _leer_pronostico_simulable_en_conexion(conexion, pronostico_id):
+    """Lectura compartida sin abrir conexión ni cambiar su transacción.
+
+    El llamador valida ID y administra mode=ro, BEGIN y cierre. Conserva el
+    orden activo/cabecera/metadatos/elegibilidad/detalles de S4-A2. No calcula.
+    Retorna conjunto, serie pública, cabecera pública y detalles como dict.
+    Depende de los helpers privados de consulta_pronosticos ya usados en A2.
+    """
+    conjunto = consulta._activo(conexion)
+    if type(conjunto) is not int or not 0 < conjunto <= 2**63 - 1:
+        raise ErrorSimulacionDesdePronostico("pronostico_corrupto")
+    fila = _cabecera(conexion, pronostico_id, conjunto)
+    cabecera = consulta._metadatos(fila)
+    if cabecera["tipo"] != "validacion":
+        raise ErrorSimulacionDesdePronostico("tipo_no_evaluable")
+    if cabecera["fecha_corte"] not in CORTES_AUTORIZADOS:
+        raise ErrorSimulacionDesdePronostico("corte_no_autorizado")
+    detalles = consulta._detalles_validos(conexion, pronostico_id, cabecera)
+    return (conjunto, {"id": fila["serie_id"], "store_nbr": fila["store_nbr"], "family": fila["family"]},
+            cabecera, [dict(d) for d in detalles])
+
+
 def simular_pronostico(ruta_base: str | Path, pronostico_id: int,
                       inventario_disponible, tiempo_abastecimiento, reserva) -> dict:
     """Lee y simula sin guardar, entrenar ni consultar observaciones o métricas.
@@ -78,31 +117,16 @@ def simular_pronostico(ruta_base: str | Path, pronostico_id: int,
     parametros_invalidos. No se publican mensajes internos. Los errores de
     programación inesperados no se suprimen ni producen resultados parciales.
     """
-    if type(pronostico_id) is not int or not 0 < pronostico_id <= 2**63 - 1:
-        raise ErrorSimulacionDesdePronostico("pronostico_invalido")
-    try:
-        if not isinstance(ruta_base, (str, Path)) or not str(ruta_base) or "\0" in str(ruta_base):
-            raise ValueError("Ruta inválida")
-        ruta = Path(ruta_base).resolve()
-    except (TypeError, ValueError, OSError, RuntimeError) as error:
-        raise ErrorSimulacionDesdePronostico("base_no_disponible") from error
+    _validar_identificador(pronostico_id)
+    ruta = _normalizar_ruta(ruta_base)
     try:
         with consulta._conexion_lectura(ruta) as conexion:
-            conjunto = consulta._activo(conexion)
-            if type(conjunto) is not int or not 0 < conjunto <= 2**63 - 1:
-                raise ErrorSimulacionDesdePronostico("pronostico_corrupto")
-            fila = _cabecera(conexion, pronostico_id, conjunto)
-            cabecera = consulta._metadatos(fila)
-            if cabecera["tipo"] != "validacion":
-                raise ErrorSimulacionDesdePronostico("tipo_no_evaluable")
-            if cabecera["fecha_corte"] not in CORTES_AUTORIZADOS:
-                raise ErrorSimulacionDesdePronostico("corte_no_autorizado")
-            detalles = consulta._detalles_validos(conexion, pronostico_id, cabecera)
+            conjunto, serie, cabecera, detalles = _leer_pronostico_simulable_en_conexion(conexion, pronostico_id)
             resultado = motor.calcular_simulacion(
-                cabecera, [dict(d) for d in detalles], inventario_disponible,
+                cabecera, detalles, inventario_disponible,
                 tiempo_abastecimiento, reserva)
             return {**resultado, "conjunto_id": conjunto,
-                    "serie": {"id": fila["serie_id"], "store_nbr": fila["store_nbr"], "family": fila["family"]}}
+                    "serie": serie}
     except consulta.ErrorConsultaPronostico as error:
         codigo = error.codigo if error.codigo in ("sin_conjunto_activo", "base_no_disponible") else "pronostico_corrupto"
         raise ErrorSimulacionDesdePronostico(codigo) from error
