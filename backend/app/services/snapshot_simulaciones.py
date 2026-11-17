@@ -38,6 +38,7 @@ _MENSAJES = {
 }
 _IDENTIDAD = ("pronostico_id", "experimento_id", "tecnica", "fecha_corte", "horizonte")
 _PARAMETROS = {"inventario_disponible", "tiempo_abastecimiento", "reserva"}
+_CAMPOS_PARAMETROS_V1 = frozenset({"inventario_disponible", "tiempo_abastecimiento", "reserva"})
 _DOCUMENTOS = ("solicitud", "origen", "contexto", "advertencias")
 _META = {"version_documento", "version_regla", "identificador_implementacion", "version_politica_numerica"}
 _RESULTADO = set(_IDENTIDAD) | {"version_regla", "parametros", "periodo_cobertura", "demanda_considerada",
@@ -179,7 +180,8 @@ def _fecha(valor):
         raise ErrorSnapshotSimulacion("estructura_invalida") from error
 
 
-def _cantidad(valor, publicada=False, signo=False):
+def _cantidad_v1(valor, publicada=False, signo=False):
+    """Representación histórica cerrada; no delega en validadores vigentes."""
     _exigir(type(valor) is float if publicada else type(valor) in (int, float))
     try:
         numero = float(valor)
@@ -192,11 +194,29 @@ def _cantidad(valor, publicada=False, signo=False):
     return 0.0 if numero == 0 else numero
 
 
+def _cantidad(valor, publicada=False, signo=False):
+    """Validación vigente de cantidades; hoy coincide con el contrato v1."""
+    return _cantidad_v1(valor, publicada, signo)
+
+
 def _textos(valor):
     _exigir(type(valor) is list and all(type(t) is str and bool(t.strip()) for t in valor))
 
 
+def _parametros_v1(parametros, publicada=False):
+    """Campos, tipos y límites originales v1, sin modificar los parámetros.
+
+    El chequeo de representación no normaliza los documentos: int, float,
+    0.0 y -0.0 conservan su identidad en solicitud/origen y en la serialización.
+    """
+    _objeto(parametros, _CAMPOS_PARAMETROS_V1)
+    for campo in ("inventario_disponible", "reserva"):
+        _cantidad_v1(parametros[campo], publicada)
+    _exigir(type(parametros["tiempo_abastecimiento"]) is int and 0 <= parametros["tiempo_abastecimiento"] <= 15)
+
+
 def _parametros(parametros, publicada=False):
+    """Política vigente para escribir; el lector histórico no la invoca."""
     _objeto(parametros, _PARAMETROS)
     for campo in ("inventario_disponible", "reserva"):
         _cantidad(parametros[campo], publicada)
@@ -235,24 +255,24 @@ def _validar_documentos(solicitud, origen, contexto, advertencias, resultados):
         _objeto(detalle, {"paso", "fecha_objetivo", "venta_estimada"})
         _coincide(detalle["paso"], paso)
         _coincide(detalle["fecha_objetivo"], fechas[paso - 1])
-        demandas.append(_cantidad(detalle["venta_estimada"]))
+        demandas.append(_cantidad_v1(detalle["venta_estimada"]))
     demanda_comun = None
     for posicion, (escenario, entrada) in enumerate(zip(escenarios, resultados), 1):
-        _objeto(escenario, {"etiqueta", *_PARAMETROS})
+        _objeto(escenario, {"etiqueta", *_CAMPOS_PARAMETROS_V1})
         _coincide(escenario["etiqueta"], "ABC"[posicion - 1])
-        parametros = {k: escenario[k] for k in _PARAMETROS}
-        _parametros(parametros)
+        parametros = {k: escenario[k] for k in _CAMPOS_PARAMETROS_V1}
+        _parametros_v1(parametros)
         _objeto(entrada, {"etiqueta", "simulacion"})
         _coincide(entrada["etiqueta"], escenario["etiqueta"])
         r = entrada["simulacion"]
         _objeto(r, _RESULTADO)
         _coincide({k: r[k] for k in _IDENTIDAD}, {k: origen[k] for k in _IDENTIDAD})
         _coincide(r["version_regla"], contexto["version_regla"])
-        _parametros(r["parametros"], publicada=True)
-        esperado = {k: _cantidad(parametros[k]) if k != "tiempo_abastecimiento" else parametros[k] for k in parametros}
+        _parametros_v1(r["parametros"], publicada=True)
+        esperado = {k: _cantidad_v1(parametros[k]) if k != "tiempo_abastecimiento" else parametros[k] for k in parametros}
         _coincide(r["parametros"], esperado)
         for campo in ("demanda_considerada", "reposicion"):
-            _cantidad(r[campo], publicada=True)
+            _cantidad_v1(r[campo], publicada=True)
         if demanda_comun is None:
             demanda_comun = r["demanda_considerada"]
         _coincide(r["demanda_considerada"], demanda_comun)
@@ -273,7 +293,7 @@ def _validar_documentos(solicitud, origen, contexto, advertencias, resultados):
             _coincide(fila["paso"], paso)
             _coincide(fila["fecha_objetivo"], fechas[paso - 1])
             for campo in _FILA - {"paso", "fecha_objetivo"}:
-                _cantidad(fila[campo], publicada=True, signo=campo == "balance_neto")
+                _cantidad_v1(fila[campo], publicada=True, signo=campo == "balance_neto")
             _coincide(fila["demanda_pronosticada"], demandas[paso - 1])
             recibida = r["reposicion"] if plazo < 15 and paso == plazo + 1 else 0.0
             _coincide(fila["recepcion_simulada"], recibida)
@@ -417,6 +437,11 @@ def preparar_snapshot(pronostico, detalles, procedencia, escenarios, resultado, 
         contexto, resultados, advertencias = (deepcopy(resultado[k]) for k in ("contexto", "resultados", "advertencias_comparacion"))
     documentos = {"solicitud": solicitud, "origen": origen, "contexto": contexto, "advertencias": deepcopy(advertencias)}
     _validar_documentos(**documentos, resultados=resultados)
+    # Una escritura nueva debe cumplir ambos contratos. La lectura histórica
+    # solo utiliza los validadores v1 anteriores y nunca entra en este bloque.
+    for escenario, entrada in zip(solicitud["escenarios"], resultados):
+        _parametros({k: escenario[k] for k in _CAMPOS_PARAMETROS_V1})
+        _parametros(entrada["simulacion"]["parametros"], publicada=True)
     paquete = {"version_documento": VERSION_DOCUMENTO, "version_regla": contexto["version_regla"],
                "identificador_implementacion": IDENTIFICADOR_IMPLEMENTACION, "version_politica_numerica": VERSION_POLITICA_NUMERICA,
                "modalidad": modalidad, "numero_escenarios": len(resultados), "conjunto_id": origen["conjunto_id"],
