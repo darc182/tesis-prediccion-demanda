@@ -4,6 +4,7 @@ import PerfilSerie from './components/PerfilSerie'
 import PerfilGlobalDatos from './components/PerfilGlobalDatos'
 import PronosticosVentas from './components/PronosticosVentas'
 import ComparacionEvaluaciones from './components/ComparacionEvaluaciones'
+import Simulaciones from './components/Simulaciones'
 import SelectorSerie, { type SerieTemporal, type SeriesState } from './components/SelectorSerie'
 import './App.css'
 
@@ -455,12 +456,7 @@ function App() {
         />
       </section>
 
-      {vista === 'simulacion' && (
-        <section className="pending-view" aria-labelledby="pending-heading">
-          <h2 id="pending-heading">{apartados.find((apartado) => apartado.id === vista)?.nombre}</h2>
-          <p>Este apartado todavía no está disponible.</p>
-        </section>
-      )}
+      {vista === 'simulacion' && <Simulaciones />}
     </main>
   )
 }
