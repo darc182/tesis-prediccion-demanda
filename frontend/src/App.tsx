@@ -456,7 +456,18 @@ function App() {
         />
       </section>
 
-      {vista === 'simulacion' && <Simulaciones />}
+      <Simulaciones
+        activo={vista === 'simulacion'}
+        seleccion={seleccionHistorico}
+        selector={{
+          state: seriesState,
+          selectedStore,
+          selectedFamily,
+          onStoreChange: handleStoreChange,
+          onFamilyChange: handleFamilyChange,
+          onRetry: handleRetrySeries,
+        }}
+      />
     </main>
   )
 }
