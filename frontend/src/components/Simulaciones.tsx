@@ -302,6 +302,45 @@ function cantidadResumen(valor: number) {
   return Object.is(Number(comparable), valor) ? visible : '≈ ' + visible
 }
 
+const FORMATO_FECHA_RESUMEN = new Intl.DateTimeFormat('es-EC', {
+  day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
+})
+
+function FechaResumen({ iso }: { iso: string }) {
+  return <time dateTime={iso}>{FORMATO_FECHA_RESUMEN.format(new Date(iso + 'T00:00:00Z'))}</time>
+}
+
+function ConclusionEscenario({ datos, escenario: e }: {
+  datos: ReturnType<typeof leerDetalle>
+  escenario: ReturnType<typeof leerEscenario>
+}) {
+  const sinReposicion = e.reposicion === 0
+  const pendienteAntes = !sinReposicion && e.dentro && e.primeraPendiente !== null && e.primeraPendiente < e.recepcion
+  const dias = e.diasNegativos === 1 ? '1 día' : e.diasNegativos + ' días'
+
+  return <div className="simulaciones-conclusion">
+    <h5>Conclusión del escenario {e.etiqueta}</h5>
+    <p>Para la tienda {datos.serie.tienda} y la familia {datos.serie.familia}, el pronóstico {datos.pronostico}
+      {' '}({datos.tecnica}) estima una demanda de <strong>{cantidadResumen(e.demanda)}</strong> entre
+      {' '}<FechaResumen iso={datos.fechas[0]} /> y <FechaResumen iso={datos.fechas[14]} />.</p>
+    <p>{sinReposicion
+      ? <>Con estos parámetros, la reposición simulada es <strong>0</strong>. No se simula una entrada de inventario.</>
+      : <>Con estos parámetros, la reposición simulada es <strong>{cantidadResumen(e.reposicion)}</strong>.
+        {' '}La recepción se simula al inicio del <FechaResumen iso={e.recepcion} />.
+        {' '}{!e.dentro && 'Esa fecha queda fuera del horizonte, por lo que la cantidad no se incorpora a estos quince días.'}</>}</p>
+    <p>{e.diasNegativos === 0
+      ? 'La simulación no registró días con balance negativo.'
+      : <>El balance neto hipotético fue negativo durante {dias}.{pendienteAntes && ' La demanda pendiente comenzó antes de la recepción simulada.'}</>}
+      {e.mayorPendiente === 0
+        ? ' No hubo demanda pendiente simulada.'
+        : <> La mayor demanda pendiente fue <strong>{cantidadResumen(e.mayorPendiente)}</strong>
+          {e.pendienteFinal === 0
+            ? ' y al cierre ya no quedaba demanda pendiente.'
+            : <> y al cierre quedaban <strong>{cantidadResumen(e.pendienteFinal)}</strong> pendientes.</>}</>}
+    </p>
+  </div>
+}
+
 function Resultado({ datos, prefijo = 'simulaciones-historica' }: { datos: ReturnType<typeof leerDetalle>; prefijo?: string }) {
   const etiquetas = datos.escenarios.map(e => e.etiqueta).join('/')
   const modalidad = datos.modalidad === 'individual' ? 'Individual · ' + etiquetas : 'Comparación ' + etiquetas
@@ -311,8 +350,8 @@ function Resultado({ datos, prefijo = 'simulaciones-historica' }: { datos: Retur
     <Datos campos={[
       ['Pronóstico', datos.pronostico],
       ...(datos.experimento === null ? [] : [['Experimento', datos.experimento] satisfies [string, number]]),
-      ['Técnica predictiva', datos.tecnica], ['Corte del pronóstico', datos.corte],
-      ['Demanda prevista para 15 días', datos.fechas[0] + ' a ' + datos.fechas[14]],
+      ['Técnica predictiva', datos.tecnica], ['Corte del pronóstico', <FechaResumen iso={datos.corte} />],
+      ['Demanda prevista para 15 días', <><FechaResumen iso={datos.fechas[0]} /> a <FechaResumen iso={datos.fechas[14]} /></>],
     ]} />
     <p>La unidad simulada es la demanda agregada de una familia en una tienda, por encima del nivel de SKU individual.
       {datos.modalidad === 'comparacion' && ' Los escenarios comparten ese pronóstico y varían las condiciones hipotéticas de inventario.'}</p>
@@ -320,21 +359,22 @@ function Resultado({ datos, prefijo = 'simulaciones-historica' }: { datos: Retur
     {datos.escenarios.map(e => <section className="simulaciones-resumen-escenario" key={e.etiqueta}
       aria-labelledby={prefijo + '-' + e.etiqueta}>
       <h4 id={prefijo + '-' + e.etiqueta}>Escenario {e.etiqueta}</h4>
+      <ConclusionEscenario datos={datos} escenario={e} />
       <div className="simulaciones-indicadores">
         <div className="simulaciones-indicador-q">
           <h5>Reposición hipotética (Q)</h5>
           <p><strong>{cantidadResumen(e.reposicion)}</strong></p>
-          {e.reposicion === 0 && <p>La regla calcula cero reposición con estos parámetros.</p>}
         </div>
         <div>
-          <h5>Recepción prevista</h5>
-          <p><strong><time dateTime={e.recepcion}>{e.recepcion}</time></strong></p>
-          <p>{e.dentro ? 'Dentro del horizonte' : 'Fuera del horizonte de 15 días'}</p>
+          <h5>Recepción simulada</h5>
+          <p><strong>{e.reposicion === 0 ? 'Sin entrada' : <FechaResumen iso={e.recepcion} />}</strong></p>
+          <p>{e.reposicion === 0 ? 'La reposición calculada es cero.'
+            : e.dentro ? 'Dentro del horizonte' : 'Fuera del horizonte de 15 días'}</p>
         </div>
         <div>
           <h5>Mayor demanda pendiente</h5>
           <p><strong>{cantidadResumen(e.mayorPendiente)}</strong></p>
-          <p>{e.primeraPendiente === null ? 'Sin demanda pendiente simulada' : 'Primera fecha con pendiente: ' + e.primeraPendiente}</p>
+          <p>{e.primeraPendiente === null ? 'Sin demanda pendiente simulada' : <>Primera fecha con pendiente: <FechaResumen iso={e.primeraPendiente} /></>}</p>
         </div>
       </div>
       <Datos campos={[
@@ -357,7 +397,8 @@ function Resultado({ datos, prefijo = 'simulaciones-historica' }: { datos: Retur
       <p>Un balance negativo indica demanda pendiente simulada. Las existencias físicas y las ventas perdidas
         requieren datos observados. El resultado es hipotético y no genera una orden de compra.</p>
       <p className="help-text">≈ indica un valor abreviado en el resumen. Un saldo muy pequeño puede deberse a la precisión
-        numérica. Consulte las cantidades completas disponibles y las advertencias originales en el detalle técnico.</p>
+        de binary64. Su signo por sí solo no demuestra un faltante físico observado. Consulte las cantidades completas
+        disponibles y las advertencias originales en el detalle técnico.</p>
     </section>
     <details className="simulaciones-detalle-tecnico" key={datos.id}>
       <summary>Ver detalle técnico y trayectoria de 15 días</summary>

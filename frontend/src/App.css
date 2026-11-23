@@ -1125,3 +1125,21 @@
 .simulaciones-resumen .simulaciones-tabla {
   overflow-wrap: normal;
 }
+
+.simulaciones-conclusion {
+  margin-block: 12px;
+  padding: 12px;
+  border: 1px solid var(--accent-border);
+  border-inline-start-width: 3px;
+  border-radius: 8px;
+  background: var(--accent-bg);
+}
+
+.simulaciones-conclusion h5 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.simulaciones-conclusion p {
+  margin-block: 8px 0;
+}
