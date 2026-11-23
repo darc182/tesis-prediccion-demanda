@@ -1,9 +1,13 @@
 import { useEffect, useId, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import type { SerieTemporal, SeriesState } from './SelectorSerie'
 import ConsolidacionEvaluaciones from './ConsolidacionEvaluaciones'
+import type { DestinoSimulacion } from './Simulaciones'
 
 type Seleccion = { conjuntoId: number; serie: SerieTemporal }
-type Props = { seleccion: Seleccion | null; activo: boolean; estadoConjunto: SeriesState['kind'] }
+type Props = {
+  seleccion: Seleccion | null; activo: boolean; estadoConjunto: SeriesState['kind']
+  simular: (destino: DestinoSimulacion) => void
+}
 const CORTES = ['2017-06-16', '2017-07-01', '2017-07-16'] as const
 type Corte = typeof CORTES[number]
 const TECNICAS = {
@@ -227,7 +231,7 @@ function Grafico({ datos, id }: { datos: Comparacion; id: string }) {
   </figure>
 }
 
-function Resultados({ datos }: { datos: Comparacion }) {
+function Resultados({ datos, simular }: { datos: Comparacion; simular: Props['simular'] }) {
   const id = useId()
   const primera = datos.resultados[0].evaluacion
   return <section aria-label="Resultado de la comparación" className="evaluation-results">
@@ -243,10 +247,16 @@ function Resultados({ datos }: { datos: Comparacion }) {
     <div className="evaluation-scroll" tabIndex={0} role="region" aria-label="Resumen de métricas desplazable">
       <table><caption>Métricas sobre las mismas fechas observadas</caption>
         <thead><tr><th scope="col">Técnica e identificación</th><th scope="col">MAE</th><th scope="col">WAPE (%)</th>
-          <th scope="col">RMSE</th><th scope="col">Observaciones evaluadas</th><th scope="col">Cobertura</th></tr></thead>
+          <th scope="col">RMSE</th><th scope="col">Observaciones evaluadas</th><th scope="col">Cobertura</th>
+          <th scope="col">Simulación</th></tr></thead>
         <tbody>{datos.resultados.map(r => <tr key={r.pronostico_id}><th scope="row">{etiqueta(r)}</th>
           <td><Valor valor={r.evaluacion.mae} /></td><td><Valor valor={r.evaluacion.wape} /></td><td><Valor valor={r.evaluacion.rmse} /></td>
-          <td>{r.evaluacion.observaciones_evaluadas}/15</td><td><Valor valor={r.evaluacion.cobertura} /> (proporción)</td></tr>)}</tbody>
+          <td>{r.evaluacion.observaciones_evaluadas}/15</td><td><Valor valor={r.evaluacion.cobertura} /> (proporción)</td>
+          <td><button type="button" aria-label={`Simular con este pronóstico: pronóstico ${r.pronostico_id}`}
+            onClick={() => simular({
+              conjuntoId: datos.conjunto_id, serie: datos.serie, pronosticoId: r.pronostico_id,
+              experimentoId: r.experimento_id, tecnica: r.tecnica, corte: datos.fecha_corte,
+            })}>Simular con este pronóstico</button></td></tr>)}</tbody>
       </table>
     </div>
     <p>MAE es el error absoluto medio. WAPE es el error absoluto ponderado, expresado en porcentaje;
@@ -270,8 +280,11 @@ function Resultados({ datos }: { datos: Comparacion }) {
   </section>
 }
 
-type PanelProps = { seleccion: Seleccion; eleccion: Eleccion; setEleccion: Dispatch<SetStateAction<Eleccion>> }
-function PanelComparacion({ seleccion, eleccion, setEleccion }: PanelProps) {
+type PanelProps = {
+  seleccion: Seleccion; eleccion: Eleccion; setEleccion: Dispatch<SetStateAction<Eleccion>>
+  simular: Props['simular']
+}
+function PanelComparacion({ seleccion, eleccion, setEleccion, simular }: PanelProps) {
   const [lista, setLista] = useState<Lista>({ kind: 'loading' })
   const [consulta, setConsulta] = useState<Consulta>({ kind: 'idle' })
   const [revision, setRevision] = useState(0)
@@ -378,11 +391,11 @@ function PanelComparacion({ seleccion, eleccion, setEleccion }: PanelProps) {
     </>}
     {consulta.kind === 'loading' && <p role="status">Consultando métricas y ventas observadas…</p>}
     {consulta.kind === 'error' && <p className="evaluation-notice" role="alert">{consulta.mensaje}</p>}
-    {lista.kind === 'success' && consulta.kind === 'success' && <Resultados datos={consulta.datos} />}
+    {lista.kind === 'success' && consulta.kind === 'success' && <Resultados datos={consulta.datos} simular={simular} />}
   </>
 }
 
-export default function ComparacionEvaluaciones({ seleccion, activo, estadoConjunto }: Props) {
+export default function ComparacionEvaluaciones({ seleccion, activo, estadoConjunto, simular }: Props) {
   // App asigna una key por conjunto y serie: un cambio de contexto descarta
   // también esta elección. Al salir solo se desmonta el panel de solicitudes.
   const [eleccion, setEleccion] = useState<Eleccion>({ corte: CORTES[0], opciones: [] })
@@ -400,7 +413,7 @@ export default function ComparacionEvaluaciones({ seleccion, activo, estadoConju
     <div id={`${idModalidad}-panel`}>
     {!seleccion ? <p>{estadoConjunto === 'no-active' ? 'No hay un conjunto activo para comparar.' :
       'Seleccione una tienda y una familia del conjunto activo para consultar sus pronósticos.'}</p> :
-      modalidad === 'corte' ? <PanelComparacion seleccion={seleccion} eleccion={eleccion} setEleccion={setEleccion} /> :
+      modalidad === 'corte' ? <PanelComparacion seleccion={seleccion} eleccion={eleccion} setEleccion={setEleccion} simular={simular} /> :
         <ConsolidacionEvaluaciones
           key={`${seleccion.conjuntoId}:${seleccion.serie.id}:${seleccion.serie.store_nbr}:${seleccion.serie.family}`}
           seleccion={seleccion} />}

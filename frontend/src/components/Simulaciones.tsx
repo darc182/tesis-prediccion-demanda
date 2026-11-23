@@ -702,7 +702,20 @@ function Historial({ control }: { control: Ref<ControlHistorial> }) {
 }
 
 type SeleccionActiva = { conjuntoId: number; serie: SerieTemporal }
+export type DestinoSimulacion = Readonly<{
+  conjuntoId: number
+  serie: Readonly<SerieTemporal>
+  pronosticoId: number
+  experimentoId: number
+  tecnica: keyof typeof TECNICAS
+  corte: string
+}>
+export type TransferenciaSimulacion = DestinoSimulacion & Readonly<{ evento: number }>
+export type AvisoTransferencia = { tipo: 'confirmada' | 'rechazada'; mensaje: string }
+type ConsumirTransferencia = (evento: number, aviso: AvisoTransferencia) => void
+
 type Pronostico = ReturnType<typeof identidad>
+type PronosticoElegible = Pronostico & { codigoTecnica: keyof typeof TECNICAS }
 type Modalidad = 'individual' | 'comparacion'
 type Campos = { inventario_disponible: string; tiempo_abastecimiento: string; reserva: string }
 type Intencion = Readonly<{
@@ -742,7 +755,7 @@ function leerPronosticos(valor: unknown, seleccion: SeleccionActiva) {
     origen.tienda === seleccion.serie.store_nbr && origen.familia === seleccion.serie.family)
   verificar(Array.isArray(d.pronosticos))
   const vistos = new Set<number>()
-  const elegibles: Pronostico[] = []
+  const elegibles: PronosticoElegible[] = []
   for (const item of d.pronosticos) {
     const p = objeto(item)
     if (p.tipo !== 'validacion' || p.horizonte !== 15 ||
@@ -752,7 +765,10 @@ function leerPronosticos(valor: unknown, seleccion: SeleccionActiva) {
       typeof p.experimento_id !== 'number' || !Number.isSafeInteger(p.experimento_id) || p.experimento_id <= 0) continue
     verificar(!vistos.has(p.id))
     vistos.add(p.id)
-    elegibles.push(identidad({ ...p, pronostico_id: p.id }))
+    elegibles.push({
+      ...identidad({ ...p, pronostico_id: p.id }),
+      codigoTecnica: p.tecnica as keyof typeof TECNICAS,
+    })
   }
   return elegibles
 }
@@ -1015,10 +1031,13 @@ function FichaPronostico({ seleccion, pronostico }: { seleccion: SeleccionActiva
   </section>
 }
 
-function FormularioSimulacion({ seleccion, bloqueado, registrar }: {
+function FormularioSimulacion({ seleccion, bloqueado, registrar, transferencia, consumirTransferencia }: {
   seleccion: SeleccionActiva; bloqueado: boolean; registrar: (intencion: Intencion) => void
+  transferencia: TransferenciaSimulacion | null; consumirTransferencia: ConsumirTransferencia
 }) {
-  const [lista, setLista] = useState<Estado<Pronostico[]>>({ tipo: 'cargando' })
+  // La navegación monta el formulario. Solo su primera consulta puede aplicar esta solicitud.
+  const porSeleccionar = useRef(transferencia)
+  const [lista, setLista] = useState<Estado<PronosticoElegible[]>>({ tipo: 'cargando' })
   const [revision, setRevision] = useState(0)
   const [id, setId] = useState('')
   const [modo, setModo] = useState<Modalidad>('individual')
@@ -1032,13 +1051,36 @@ function FormularioSimulacion({ seleccion, bloqueado, registrar }: {
     const esperado = { conjuntoId, serie: { id: serieId, store_nbr, family } }
     void obtener('/api/pronosticos/active/series/' + serieId, controlador.signal)
       .then(valor => {
-        if (!controlador.signal.aborted) setLista({ tipo: 'listo', datos: leerPronosticos(valor, esperado) })
+        if (controlador.signal.aborted) return
+        const datos = leerPronosticos(valor, esperado)
+        setLista({ tipo: 'listo', datos })
+        const solicitud = porSeleccionar.current
+        if (!solicitud) return
+        porSeleccionar.current = null
+        const coincidencia = datos.find(p => p.pronostico === solicitud.pronosticoId &&
+          p.experimento === solicitud.experimentoId && p.codigoTecnica === solicitud.tecnica && p.corte === solicitud.corte)
+        if (coincidencia) {
+          setId(String(coincidencia.pronostico))
+          consumirTransferencia(solicitud.evento, {
+            tipo: 'confirmada', mensaje: `Pronóstico ${coincidencia.pronostico} verificado al abrir Simulación. Revise la ficha del pronóstico que vaya a utilizar.`,
+          })
+        } else {
+          consumirTransferencia(solicitud.evento, {
+            tipo: 'rechazada', mensaje: 'El pronóstico solicitado no figura con la misma identidad en el listado elegible. Seleccione un pronóstico explícitamente para continuar.',
+          })
+        }
       })
       .catch(() => {
-        if (!controlador.signal.aborted) setLista({ tipo: 'error', mensaje: 'No se pudo consultar el listado de pronósticos de esta serie.' })
+        if (controlador.signal.aborted) return
+        setLista({ tipo: 'error', mensaje: 'No se pudo consultar el listado de pronósticos de esta serie.' })
+        const solicitud = porSeleccionar.current
+        porSeleccionar.current = null
+        if (solicitud) consumirTransferencia(solicitud.evento, {
+          tipo: 'rechazada', mensaje: 'No se pudo verificar el pronóstico solicitado. Actualice el listado y elija un pronóstico.',
+        })
       })
     return () => controlador.abort()
-  }, [conjuntoId, serieId, store_nbr, family, revision])
+  }, [conjuntoId, serieId, store_nbr, family, revision, consumirTransferencia])
 
   const pronostico = lista.tipo === 'listo' ? lista.datos.find(p => String(p.pronostico) === id) : undefined
   const numeroEscenarios = modo === 'individual' ? 1 : tercero ? 3 : 2
@@ -1048,7 +1090,8 @@ function FormularioSimulacion({ seleccion, bloqueado, registrar }: {
     if (bloqueado || !pronostico) return
     setError('')
     try {
-      registrar(nuevaIntencion(seleccion, pronostico, modo, campos.slice(0, numeroEscenarios)))
+      const { pronostico: id, experimento, tecnica, corte } = pronostico
+      registrar(nuevaIntencion(seleccion, { pronostico: id, experimento, tecnica, corte }, modo, campos.slice(0, numeroEscenarios)))
     } catch (error) {
       setError(error instanceof ErrorHistorial ? error.message : 'No se pudo preparar el registro.')
     }
@@ -1107,14 +1150,18 @@ type Props = {
   activo: boolean
   seleccion: SeleccionActiva | null
   selector: Omit<ComponentProps<typeof SelectorSerie>, 'idPrefix'>
+  transferencia: TransferenciaSimulacion | null
+  avisoTransferencia: AvisoTransferencia | null
+  consumirTransferencia: ConsumirTransferencia
 }
 
-export default function Simulaciones({ activo, seleccion, selector }: Props) {
+export default function Simulaciones({ activo, seleccion, selector, transferencia, avisoTransferencia, consumirTransferencia }: Props) {
   const [estado, setEstado] = useState<Envio>({ tipo: 'borrador' })
   const [confirmada, setConfirmada] = useState<ReturnType<typeof leerConfirmacion> | null>(null)
   const [pedirDescarte, setPedirDescarte] = useState(false)
   const historial = useRef<ControlHistorial>(null)
   const ocupada = useRef(false)
+  const tituloCreacion = useRef<HTMLHeadingElement>(null)
 
   async function registrar(intencion: Intencion, reintento = false) {
     if (ocupada.current) return
@@ -1141,9 +1188,6 @@ export default function Simulaciones({ activo, seleccion, selector }: Props) {
     }
   }
 
-  // La intención permanece en el componente padre al salir de la pestaña.
-  // Se desmontan únicamente los paneles que hacen consultas GET.
-  if (!activo) return null
   const segura = seleccion && Number.isSafeInteger(seleccion.conjuntoId) && seleccion.conjuntoId > 0 &&
     Number.isSafeInteger(seleccion.serie.id) && seleccion.serie.id > 0 &&
     Number.isSafeInteger(seleccion.serie.store_nbr) && seleccion.serie.store_nbr > 0
@@ -1151,19 +1195,40 @@ export default function Simulaciones({ activo, seleccion, selector }: Props) {
   const rechazo = estado.tipo === 'error' || estado.tipo === 'conflicto' ? estado : null
   const pendiente = estado.tipo === 'desconocido' || rechazo?.conservar === true
   const bloqueado = estado.tipo === 'enviando' || pendiente
+  const coincideContexto = transferencia !== null && contexto === claveContexto(transferencia)
+
+  useEffect(() => {
+    if (!activo || !transferencia) return
+    tituloCreacion.current?.focus()
+    if (bloqueado || !coincideContexto) consumirTransferencia(transferencia.evento, {
+      tipo: 'rechazada',
+      mensaje: bloqueado
+        ? 'Hay una solicitud de registro pendiente. Resuélvala explícitamente antes de transferir otro pronóstico.'
+        : 'El conjunto o la serie cambió antes de verificar el pronóstico. Vuelva a elegirlo en la vista de origen.',
+    })
+  }, [activo, transferencia, bloqueado, coincideContexto, consumirTransferencia])
+
+  // La intención permanece en el componente padre al salir de la pestaña.
+  // Se desmontan únicamente los paneles que hacen consultas GET.
+  if (!activo) return null
   const origen = estado.tipo === 'borrador' ? null : estado.intencion
   const visible = confirmada?.contexto === contexto ? confirmada : null
 
   return <div className="simulaciones-paneles">
     <section className="simulaciones-card" aria-labelledby="simulaciones-creacion">
-      <h2 id="simulaciones-creacion">Crear nueva simulación</h2>
+      <h2 id="simulaciones-creacion" tabIndex={-1} ref={tituloCreacion}>Crear nueva simulación</h2>
+      {avisoTransferencia && <p role={avisoTransferencia.tipo === 'confirmada' ? 'status' : 'alert'}>
+        {avisoTransferencia.mensaje}
+      </p>}
       <p>Los parámetros son hipotéticos. El dataset no contiene inventario observado y el registro no genera órdenes de compra.</p>
       <SelectorSerie {...selector} idPrefix="simulaciones-creacion" />
       {seleccion && !segura && <p role="alert">La selección contiene un identificador fuera del rango seguro del navegador.</p>}
       {!seleccion && <p role="status">Seleccione una tienda y una familia del conjunto activo para crear una simulación.</p>}
       <p id="simulaciones-parametros-ayuda" className="help-text">Ingrese cantidades no negativas con punto decimal. Use 0 para cero entero, 0.0 para cero decimal y -0.0 para cero negativo. Cada cantidad admite hasta 64 caracteres. El plazo admite enteros de 0 a 15 días.</p>
       {segura && seleccion && <FormularioSimulacion key={contexto} seleccion={seleccion}
-        bloqueado={bloqueado} registrar={intencion => { void registrar(intencion) }} />}
+        bloqueado={bloqueado} registrar={intencion => { void registrar(intencion) }}
+        transferencia={coincideContexto && !bloqueado ? transferencia : null}
+        consumirTransferencia={consumirTransferencia} />}
       {origen && <p>Solicitud del pronóstico {origen.pronostico.pronostico} · conjunto {origen.conjunto} ·
         {' '}serie {origen.serie.id} · tienda {origen.serie.tienda} · {origen.serie.familia}.</p>}
       {estado.tipo === 'enviando' && <p role="status">{estado.mensaje}</p>}

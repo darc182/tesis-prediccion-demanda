@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 'react'
 import type { SerieTemporal } from './SelectorSerie'
+import type { DestinoSimulacion } from './Simulaciones'
 
 type Seleccion = { conjuntoId: number; serie: SerieTemporal }
-type Props = { seleccion: Seleccion | null; activo: boolean }
+type Props = { seleccion: Seleccion | null; activo: boolean; simular: (destino: DestinoSimulacion) => void }
 const TECNICAS = [
   { id: 'estacional_semanal_recursiva', nombre: 'Línea base estacional semanal' },
   { id: 'random_forest', nombre: 'Random Forest' },
@@ -666,10 +667,11 @@ function ConsultaDisponibilidad({ seleccion, corte, grupo, pendiente }: {
 type PanelProps = {
   seleccion: Seleccion; activo: boolean; pendiente: boolean; revision: number
   iniciar: (solicitud: SolicitudEnCurso) => boolean
+  simular: Props['simular']
   finalizar: (cambioSeleccion: boolean) => void
 }
 
-function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, finalizar }: PanelProps) {
+function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, finalizar, simular }: PanelProps) {
   const { conjuntoId, serie: { id: serieId, store_nbr: tienda, family: familia } } = seleccion
   const [tecnica, setTecnica] = useState<Tecnica>('estacional_semanal_recursiva')
   const [corte, setCorte] = useState<Corte>('2017-06-16')
@@ -1162,7 +1164,13 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
                   onClick={() => { void consultarDetalle(p) }}>Ver pronóstico</button>
                   <button type="button" disabled={configuracionGuardada.kind === 'loading' && configuracionGuardada.id === p.id}
                     aria-label={`Ver configuración del pronóstico ${p.id}`}
-                    onClick={() => { void consultarConfiguracion(p) }}>Ver configuración</button></td>
+                    onClick={() => { void consultarConfiguracion(p) }}>Ver configuración</button>
+                  <button type="button" disabled={pendiente}
+                    aria-label={`Simular con este pronóstico: pronóstico ${p.id}`}
+                    onClick={() => simular({
+                      ...seleccion, pronosticoId: p.id, experimentoId: p.experimento_id,
+                      tecnica: p.tecnica, corte: p.fecha_corte,
+                    })}>Simular con este pronóstico</button></td>
                 <td className="forecast-comparison-choice">
                   <label><input type="checkbox" checked={seleccionComparacion.some(item => item.id === p.id)}
                     disabled={motivoComparacion(p) !== null}
@@ -1220,7 +1228,7 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   )
 }
 
-function PronosticosVentas({ seleccion, activo }: Props) {
+function PronosticosVentas({ seleccion, activo, simular }: Props) {
   // Este contenedor no se reinicia al cambiar de selección: conserva el bloqueo
   // del POST. Solo el panel con resultados usa una clave de conjunto/serie.
   const [generando, setGenerando] = useState<SolicitudEnCurso | null>(null)
@@ -1256,7 +1264,7 @@ function PronosticosVentas({ seleccion, activo }: Props) {
     {seleccion === null
       ? <p role="status">Seleccione una tienda y una familia válidas para consultar o generar pronósticos.</p>
       : <PanelPronosticos key={`${seleccion.conjuntoId}:${seleccion.serie.id}`} seleccion={seleccion}
-        activo={activo} pendiente={generando !== null} revision={revision} iniciar={iniciar} finalizar={finalizar} />}
+        activo={activo} pendiente={generando !== null} revision={revision} iniciar={iniciar} finalizar={finalizar} simular={simular} />}
   </section>
 }
 

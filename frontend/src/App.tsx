@@ -4,7 +4,9 @@ import PerfilSerie from './components/PerfilSerie'
 import PerfilGlobalDatos from './components/PerfilGlobalDatos'
 import PronosticosVentas from './components/PronosticosVentas'
 import ComparacionEvaluaciones from './components/ComparacionEvaluaciones'
-import Simulaciones from './components/Simulaciones'
+import Simulaciones, {
+  type AvisoTransferencia, type DestinoSimulacion, type TransferenciaSimulacion,
+} from './components/Simulaciones'
 import SelectorSerie, { type SerieTemporal, type SeriesState } from './components/SelectorSerie'
 import './App.css'
 
@@ -99,6 +101,11 @@ function App() {
   const [seriesState, setSeriesState] = useState<SeriesState>({ kind: 'loading' })
   const [selectedStore, setSelectedStore] = useState<number | null>(null)
   const [selectedFamily, setSelectedFamily] = useState<string | null>(null)
+  const [transferencia, setTransferencia] = useState<TransferenciaSimulacion | null>(null)
+  const [avisoTransferencia, setAvisoTransferencia] = useState<AvisoTransferencia | null>(null)
+  const [errorOrigen, setErrorOrigen] = useState(false)
+  const eventoTransferencia = useRef(0)
+  const transicionActiva = useRef(false)
   const seriesRequest = useRef<AbortController | null>(null)
 
   const refreshSeries = useCallback(async () => {
@@ -298,6 +305,43 @@ function App() {
     ? { conjuntoId: seriesState.conjuntoId, serie: serieSeleccionada }
     : null
 
+  function abrirVista(destino: Vista) {
+    if (destino === vista) return
+    eventoTransferencia.current++
+    transicionActiva.current = false
+    setTransferencia(null)
+    setAvisoTransferencia(null)
+    setErrorOrigen(false)
+    setVista(destino)
+  }
+
+  function simularConPronostico(destino: DestinoSimulacion) {
+    if (transicionActiva.current || (vista !== 'pronosticos' && vista !== 'comparacion')) return
+    const { conjuntoId, serie, pronosticoId, experimentoId } = destino
+    const idsSeguros = [conjuntoId, serie.id, serie.store_nbr, pronosticoId, experimentoId]
+      .every(id => Number.isSafeInteger(id) && id > 0)
+    if (!idsSeguros || !seleccionHistorico || conjuntoId !== seleccionHistorico.conjuntoId ||
+        serie.id !== seleccionHistorico.serie.id || serie.store_nbr !== seleccionHistorico.serie.store_nbr ||
+        serie.family !== seleccionHistorico.serie.family) {
+      setErrorOrigen(true)
+      return
+    }
+    transicionActiva.current = true
+    const evento = ++eventoTransferencia.current
+    setTransferencia({ ...destino, evento })
+    setAvisoTransferencia(null)
+    setErrorOrigen(false)
+    setVista('simulacion')
+  }
+
+  const consumirTransferencia = useCallback((evento: number, aviso: AvisoTransferencia) => {
+    // Una respuesta de una navegación anterior no puede consumir la siguiente.
+    if (eventoTransferencia.current !== evento) return
+    eventoTransferencia.current++
+    setTransferencia(actual => actual?.evento === evento ? null : actual)
+    setAvisoTransferencia(aviso)
+  }, [])
+
   return (
     <main className="app-page">
       <header className="page-header">
@@ -317,12 +361,17 @@ function App() {
             key={apartado.id}
             type="button"
             aria-current={vista === apartado.id ? 'page' : undefined}
-            onClick={() => setVista(apartado.id)}
+            onClick={() => abrirVista(apartado.id)}
           >
             {apartado.nombre}
           </button>
         ))}
       </nav>
+
+      {errorOrigen && <div className="feedback feedback--error">
+        <p role="alert">El pronóstico ya no coincide con el conjunto o la serie seleccionada. Actualice las series y vuelva a elegirlo.</p>
+        <button type="button" onClick={() => { setErrorOrigen(false); handleRetrySeries() }}>Actualizar series</button>
+      </div>}
 
       <section className="app-view" aria-label="Datos" hidden={vista !== 'datos'}>
         <section className="upload-card" aria-labelledby="upload-heading">
@@ -435,7 +484,7 @@ function App() {
           onFamilyChange={handleFamilyChange}
           onRetry={handleRetrySeries}
         />
-        <PronosticosVentas seleccion={seleccionHistorico} activo={vista === 'pronosticos'} />
+        <PronosticosVentas seleccion={seleccionHistorico} activo={vista === 'pronosticos'} simular={simularConPronostico} />
       </section>
 
       <section className="app-view" aria-label="Comparación" hidden={vista !== 'comparacion'}>
@@ -453,12 +502,16 @@ function App() {
           seleccion={seleccionHistorico}
           estadoConjunto={seriesState.kind}
           activo={vista === 'comparacion'}
+          simular={simularConPronostico}
         />
       </section>
 
       <Simulaciones
         activo={vista === 'simulacion'}
         seleccion={seleccionHistorico}
+        transferencia={transferencia}
+        avisoTransferencia={avisoTransferencia}
+        consumirTransferencia={consumirTransferencia}
         selector={{
           state: seriesState,
           selectedStore,
