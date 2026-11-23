@@ -1,4 +1,4 @@
-import { useEffect, useImperativeHandle, useRef, useState, type ComponentProps, type FormEvent, type ReactNode, type Ref } from 'react'
+import { useEffect, useImperativeHandle, useId, useRef, useState, type ComponentProps, type FormEvent, type ReactNode, type Ref } from 'react'
 import SelectorSerie, { type SerieTemporal } from './SelectorSerie'
 
 const HISTORIAL = '/api/simulaciones/historial'
@@ -341,6 +341,119 @@ function ConclusionEscenario({ datos, escenario: e }: {
   </div>
 }
 
+const MAGNITUDES_TRAYECTORIA = [
+  { clave: 'balance', nombre: 'Balance neto' },
+  { clave: 'disponible', nombre: 'Disponible hipotético' },
+  { clave: 'pendiente', nombre: 'Demanda pendiente' },
+] as const
+
+type MagnitudTrayectoria = typeof MAGNITUDES_TRAYECTORIA[number]
+type EscenarioTrayectoria = ReturnType<typeof leerEscenario>
+
+const EJE_TRAYECTORIA = new Intl.NumberFormat('es-EC', { maximumFractionDigits: 2 })
+
+function PuntoTrayectoria({ indice, x, y }: { indice: number; x: number; y: number }) {
+  if (indice === 0) return <circle className="simulaciones-punto" cx={x} cy={y} r="4.5" />
+  if (indice === 1) return <rect className="simulaciones-punto" x={x - 3.5} y={y - 3.5} width="7" height="7" />
+  return <path className="simulaciones-punto" d={'M' + x + ',' + (y - 3) + ' l3,3 -3,3 -3,-3 Z'} />
+}
+
+function GraficoTrayectoria({ fechas, escenarios, magnitud }: {
+  fechas: string[]
+  escenarios: EscenarioTrayectoria[]
+  magnitud?: MagnitudTrayectoria
+}) {
+  const id = useId()
+  const titulo = magnitud
+    ? 'Comparación de trayectorias · ' + magnitud.nombre
+    : 'Trayectoria diaria · Escenario ' + escenarios[0].etiqueta
+  const series = magnitud
+    ? escenarios.map(e => ({ nombre: 'Escenario ' + e.etiqueta, valores: e.trayectoria.map(d => d[magnitud.clave]) }))
+    : MAGNITUDES_TRAYECTORIA.map(m => ({ nombre: m.nombre, valores: escenarios[0].trayectoria.map(d => d[m.clave]) }))
+  const valores = series.flatMap(s => s.valores)
+  const minimo = Math.min(0, ...valores)
+  const maximo = Math.max(0, ...valores)
+  // Normalizar antes de restar evita desbordar con extremos de signo opuesto.
+  const unidad = Math.max(Math.abs(minimo), maximo) || 1
+  const superior = maximo / unidad
+  const amplitud = superior - minimo / unidad
+  const x = (i: number) => 98 + i / (fechas.length - 1) * 600
+  const y = (v: number) => amplitud === 0 ? 110 : 38 + (superior - v / unidad) / amplitud * 144
+  const divisiones = [0, minimo, maximo].filter((v, i) => i === 0 || v !== 0 && Math.abs(y(v) - y(0)) >= 18)
+
+  const recepciones = new Map<number, string[]>()
+  for (const e of escenarios) {
+    const posicion = fechas.indexOf(e.recepcion)
+    if (e.reposicion > 0 && e.dentro && posicion >= 0) {
+      recepciones.set(posicion, [...(recepciones.get(posicion) ?? []), e.etiqueta])
+    }
+  }
+
+  return <figure className="simulaciones-grafico">
+    <figcaption id={id + '-titulo'}>{titulo}</figcaption>
+    <ul className="simulaciones-grafico-leyenda" aria-label="Leyenda">
+      {series.map((s, i) => <li key={s.nombre}>
+        <svg viewBox="0 0 32 12" className={'simulaciones-trazo-' + i} aria-hidden="true">
+          <path className="simulaciones-curva" d="M0,6 H32" />
+          <PuntoTrayectoria indice={i} x={16} y={6} />
+        </svg>
+        {s.nombre}
+      </li>)}
+    </ul>
+    <div className="simulaciones-grafico-scroll" role="region" aria-labelledby={id + '-titulo'} tabIndex={0}>
+      <svg viewBox="0 0 720 230" role="img" aria-labelledby={id + '-titulo'} aria-describedby={id + '-desc'}>
+        <desc id={id + '-desc'}>Quince puntos por serie, uno por día. La línea de cero separa los saldos positivos y negativos.
+          Las fechas de recepción se identifican debajo del gráfico. Los valores diarios completos están en el detalle técnico.</desc>
+        <text x="98" y="16">Unidades de demanda · tienda y familia</text>
+        {divisiones.map(v => <g key={v}>
+          <line className={v === 0 ? 'simulaciones-grafico-cero' : 'simulaciones-grafico-eje'}
+            x1="98" x2="698" y1={y(v)} y2={y(v)} />
+          <text x="90" y={y(v) + 4} textAnchor="end">
+            {(Math.abs(v) >= 1e6 || v !== 0 && Math.abs(v) < 0.01 ? FORMATO_RESIDUO : EJE_TRAYECTORIA).format(v)}
+          </text>
+        </g>)}
+        {[...recepciones].map(([i, etiquetas]) => <g key={i}>
+          <line className="simulaciones-grafico-recepcion" x1={x(i)} x2={x(i)} y1="38" y2="182" />
+          <text x={x(i)} y="32" textAnchor="middle">{magnitud ? etiquetas.join('/') : 'R'}</text>
+        </g>)}
+        <path className="simulaciones-grafico-eje" d="M98,38 V182 H698" />
+        {fechas.map((dia, i) => <text key={dia} x={x(i)} y="201" textAnchor="middle">
+          {dia.slice(8, 10)}/{dia.slice(5, 7)}
+        </text>)}
+        <text x="390" y="223" textAnchor="middle">Fecha del pronóstico (día/mes)</text>
+        {series.map((s, i) => <g key={s.nombre} className={'simulaciones-trazo-' + i}>
+          <polyline className="simulaciones-curva" points={s.valores.map((v, j) => x(j) + ',' + y(v)).join(' ')} />
+          {s.valores.map((v, j) => <PuntoTrayectoria key={fechas[j]} indice={i} x={x(j)} y={y(v)} />)}
+        </g>)}
+      </svg>
+    </div>
+    <ul className="simulaciones-grafico-recepciones" aria-label="Entradas simuladas">
+      {escenarios.map(e => <li key={e.etiqueta}>
+        {magnitud && <strong>Escenario {e.etiqueta}. </strong>}
+        {e.reposicion === 0 ? 'Sin entrada simulada'
+          : e.dentro && fechas.includes(e.recepcion)
+            ? <>Recepción simulada ({magnitud ? e.etiqueta : 'R'}) el <FechaResumen iso={e.recepcion} /> · Q hipotética: {cantidadResumen(e.reposicion)}</>
+            : <>Recepción simulada fuera de las fechas del gráfico: <FechaResumen iso={e.recepcion} />.</>}
+      </li>)}
+    </ul>
+    <p className="help-text">Los puntos son observaciones diarias simuladas y los segmentos guían la lectura.
+      Si dos valores coinciden visualmente, incluso junto a cero, consulta su valor completo en el detalle técnico.</p>
+  </figure>
+}
+
+function ComparacionTrayectorias({ datos }: { datos: ReturnType<typeof leerDetalle> }) {
+  const [magnitud, elegir] = useState<MagnitudTrayectoria>(MAGNITUDES_TRAYECTORIA[0])
+  return <section className="simulaciones-comparacion-trayectoria" aria-label="Comparación de escenarios">
+    <h4>Comparar escenarios</h4>
+    <p>Un mismo pronóstico con condiciones hipotéticas distintas. Los escenarios comparten las quince fechas y la escala de la magnitud seleccionada.</p>
+    <div className="simulaciones-acciones" role="group" aria-label="Magnitud de la comparación">
+      {MAGNITUDES_TRAYECTORIA.map(m => <button key={m.clave} type="button" aria-pressed={m.clave === magnitud.clave}
+        onClick={() => elegir(m)}>{m.nombre}</button>)}
+    </div>
+    <GraficoTrayectoria fechas={datos.fechas} escenarios={datos.escenarios} magnitud={magnitud} />
+  </section>
+}
+
 function Resultado({ datos, prefijo = 'simulaciones-historica' }: { datos: ReturnType<typeof leerDetalle>; prefijo?: string }) {
   const etiquetas = datos.escenarios.map(e => e.etiqueta).join('/')
   const modalidad = datos.modalidad === 'individual' ? 'Individual · ' + etiquetas : 'Comparación ' + etiquetas
@@ -356,6 +469,7 @@ function Resultado({ datos, prefijo = 'simulaciones-historica' }: { datos: Retur
     <p>La unidad simulada es la demanda agregada de una familia en una tienda, por encima del nivel de SKU individual.
       {datos.modalidad === 'comparacion' && ' Los escenarios comparten ese pronóstico y varían las condiciones hipotéticas de inventario.'}</p>
 
+    <p className="simulaciones-graficos-ayuda help-text">En pantallas estrechas, desplaza cada gráfico para recorrer las quince fechas.</p>
     {datos.escenarios.map(e => <section className="simulaciones-resumen-escenario" key={e.etiqueta}
       aria-labelledby={prefijo + '-' + e.etiqueta}>
       <h4 id={prefijo + '-' + e.etiqueta}>Escenario {e.etiqueta}</h4>
@@ -387,20 +501,24 @@ function Resultado({ datos, prefijo = 'simulaciones-historica' }: { datos: Retur
         ['Disponible al cierre', cantidadResumen(e.disponibleFinal)],
         ['Pendiente al cierre', cantidadResumen(e.pendienteFinal)],
       ]} />
+      <GraficoTrayectoria fechas={datos.fechas} escenarios={[e]} />
     </section>)}
+
+    {datos.modalidad === 'comparacion' && <ComparacionTrayectorias key={'comparacion-' + datos.id} datos={datos} />}
 
     <section aria-labelledby={prefijo + '-interpretacion'}>
       <h4 id={prefijo + '-interpretacion'}>Cómo interpretar el resultado</h4>
       <p>La cantidad calculada sigue la regla Q = max(0, D15 + reserva − inventario inicial).
         La recepción se simula al inicio del día posterior a cumplir el plazo (L + 1).
         Q es independiente del plazo. Un plazo más largo puede aumentar la demanda pendiente antes de la recepción.</p>
-      <p>Un balance negativo indica demanda pendiente simulada. Las existencias físicas y las ventas perdidas
-        requieren datos observados. El resultado es hipotético y no genera una orden de compra.</p>
+      <p>El balance neto muestra el saldo hipotético de cada día. El disponible hipotético muestra la cantidad que quedaría
+        disponible y la demanda pendiente muestra la cantidad aún por cubrir. Un balance negativo indica demanda pendiente simulada.
+        Las existencias físicas y las ventas perdidas requieren datos observados. El resultado es hipotético y no genera una orden de compra.</p>
       <p className="help-text">≈ indica un valor abreviado en el resumen. Un saldo muy pequeño puede deberse a la precisión
         de binary64. Su signo por sí solo no demuestra un faltante físico observado. Consulte las cantidades completas
         disponibles y las advertencias originales en el detalle técnico.</p>
     </section>
-    <details className="simulaciones-detalle-tecnico" key={datos.id}>
+    <details className="simulaciones-detalle-tecnico" key={'detalle-' + datos.id}>
       <summary>Ver detalle técnico y trayectoria de 15 días</summary>
       <Detalle datos={datos} prefijo={prefijo + '-detalle'} />
     </details>

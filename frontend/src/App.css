@@ -1143,3 +1143,96 @@
 .simulaciones-conclusion p {
   margin-block: 8px 0;
 }
+
+.simulaciones-grafico {
+  min-width: 0;
+  margin: 16px 0 0;
+}
+
+.simulaciones-grafico figcaption {
+  color: var(--text-h);
+  font-weight: 700;
+}
+
+.simulaciones-grafico-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.simulaciones-grafico-scroll > svg {
+  display: block;
+  width: 100%;
+  min-width: 550px;
+}
+
+.simulaciones-grafico-scroll text {
+  fill: var(--text-h);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.simulaciones-grafico-eje {
+  fill: none;
+  stroke: var(--border);
+}
+
+.simulaciones-grafico-cero {
+  stroke: var(--text);
+  stroke-width: 1.5;
+}
+
+.simulaciones-grafico-recepcion {
+  stroke: var(--text-h);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 4;
+}
+
+.simulaciones-trazo-0 { --trazo: light-dark(#593092, #d8b4fe); }
+.simulaciones-trazo-1 { --trazo: light-dark(#00675b, #5eead4); }
+.simulaciones-trazo-2 { --trazo: light-dark(#9a3412, #fdba74); }
+
+.simulaciones-curva,
+.simulaciones-punto {
+  fill: none;
+  stroke: var(--trazo);
+  stroke-width: 2;
+}
+
+.simulaciones-trazo-1 .simulaciones-curva { stroke-dasharray: 8 4; }
+.simulaciones-trazo-2 .simulaciones-curva { stroke-dasharray: 2 4; }
+
+.simulaciones-grafico-leyenda {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-block: 10px;
+  padding: 0;
+  list-style: none;
+}
+
+.simulaciones-grafico-leyenda li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.simulaciones-grafico-leyenda svg {
+  width: 32px;
+  height: 12px;
+  flex: none;
+}
+
+.simulaciones-grafico-recepciones {
+  padding-inline-start: 22px;
+}
+
+.simulaciones-graficos-ayuda {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .simulaciones-graficos-ayuda {
+    display: block;
+  }
+}
