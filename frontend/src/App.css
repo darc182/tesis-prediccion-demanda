@@ -1057,3 +1057,71 @@
   margin-top: 10px;
   cursor: pointer;
 }
+
+.simulaciones-resumen {
+  min-width: 0;
+  margin-top: 18px;
+  overflow-wrap: anywhere;
+}
+
+.simulaciones-resumen :is(h3, h4, h5, strong) {
+  color: var(--text-h);
+}
+
+.simulaciones-resumen h3 {
+  margin-block: 0 8px;
+}
+
+.simulaciones-resumen-escenario {
+  margin-block: 16px;
+  padding: clamp(10px, 3vw, 18px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.simulaciones-resumen-escenario h4 {
+  margin-block: 0 10px;
+}
+
+.simulaciones-indicadores {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr));
+  gap: 8px;
+}
+
+.simulaciones-indicadores > div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code-bg);
+}
+
+.simulaciones-indicadores .simulaciones-indicador-q {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.simulaciones-indicadores :is(h5, p) {
+  margin-block: 0 4px;
+}
+
+.simulaciones-indicadores strong {
+  font-size: 1.08rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.simulaciones-indicador-q strong {
+  font-size: clamp(1.25rem, 4vw, 1.65rem);
+}
+
+.simulaciones-detalle-tecnico > summary {
+  cursor: pointer;
+  padding-block: 8px;
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.simulaciones-resumen .simulaciones-tabla {
+  overflow-wrap: normal;
+}

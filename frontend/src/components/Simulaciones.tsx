@@ -284,9 +284,91 @@ function Notas({ titulo, notas }: { titulo: string; notas: string[] }) {
     <ul>{notas.map((nota, i) => <li key={i}>{nota}</li>)}</ul></div>
 }
 
-function Detalle({ datos, prefijo = 'simulaciones-detalle' }: { datos: ReturnType<typeof leerDetalle>; prefijo?: string }) {
+
+const FORMATO_RESUMEN = new Intl.NumberFormat('es-EC', { maximumFractionDigits: 3 })
+const FORMATO_RESIDUO = new Intl.NumberFormat('es-EC', { notation: 'scientific', maximumSignificantDigits: 4 })
+
+function cantidadResumen(valor: number) {
+  if (Number.isInteger(valor) && !Number.isSafeInteger(valor)) return numero(valor)
+  const formato = valor !== 0 && Math.abs(valor) < 0.001 ? FORMATO_RESIDUO : FORMATO_RESUMEN
+  const partes = formato.formatToParts(valor)
+  const comparable = partes.map(({ type, value }) => {
+    if (type === 'decimal') return '.'
+    if (type === 'exponentSeparator') return 'e'
+    if (type === 'minusSign' || type === 'exponentMinusSign') return '-'
+    return type === 'group' || type === 'literal' ? '' : value
+  }).join('')
+  const visible = partes.map(({ value }) => value).join('')
+  return Object.is(Number(comparable), valor) ? visible : '≈ ' + visible
+}
+
+function Resultado({ datos, prefijo = 'simulaciones-historica' }: { datos: ReturnType<typeof leerDetalle>; prefijo?: string }) {
+  const etiquetas = datos.escenarios.map(e => e.etiqueta).join('/')
+  const modalidad = datos.modalidad === 'individual' ? 'Individual · ' + etiquetas : 'Comparación ' + etiquetas
+  return <section className="simulaciones-resumen" aria-labelledby={prefijo}>
+    <h3 id={prefijo}>Resultado de la simulación · Ejecución {datos.id}</h3>
+    <p><strong>Tienda {datos.serie.tienda} · {datos.serie.familia}</strong> · {modalidad}</p>
+    <Datos campos={[
+      ['Pronóstico', datos.pronostico],
+      ...(datos.experimento === null ? [] : [['Experimento', datos.experimento] satisfies [string, number]]),
+      ['Técnica predictiva', datos.tecnica], ['Corte del pronóstico', datos.corte],
+      ['Demanda prevista para 15 días', datos.fechas[0] + ' a ' + datos.fechas[14]],
+    ]} />
+    <p>La unidad simulada es la demanda agregada de una familia en una tienda, por encima del nivel de SKU individual.
+      {datos.modalidad === 'comparacion' && ' Los escenarios comparten ese pronóstico y varían las condiciones hipotéticas de inventario.'}</p>
+
+    {datos.escenarios.map(e => <section className="simulaciones-resumen-escenario" key={e.etiqueta}
+      aria-labelledby={prefijo + '-' + e.etiqueta}>
+      <h4 id={prefijo + '-' + e.etiqueta}>Escenario {e.etiqueta}</h4>
+      <div className="simulaciones-indicadores">
+        <div className="simulaciones-indicador-q">
+          <h5>Reposición hipotética (Q)</h5>
+          <p><strong>{cantidadResumen(e.reposicion)}</strong></p>
+          {e.reposicion === 0 && <p>La regla calcula cero reposición con estos parámetros.</p>}
+        </div>
+        <div>
+          <h5>Recepción prevista</h5>
+          <p><strong><time dateTime={e.recepcion}>{e.recepcion}</time></strong></p>
+          <p>{e.dentro ? 'Dentro del horizonte' : 'Fuera del horizonte de 15 días'}</p>
+        </div>
+        <div>
+          <h5>Mayor demanda pendiente</h5>
+          <p><strong>{cantidadResumen(e.mayorPendiente)}</strong></p>
+          <p>{e.primeraPendiente === null ? 'Sin demanda pendiente simulada' : 'Primera fecha con pendiente: ' + e.primeraPendiente}</p>
+        </div>
+      </div>
+      <Datos campos={[
+        ['Demanda prevista (D15)', cantidadResumen(e.demanda)],
+        ['Inventario inicial hipotético', cantidadResumen(e.parametros.inventario)],
+        ['Reserva objetivo', cantidadResumen(e.parametros.reserva)],
+        ['Plazo de abastecimiento', e.parametros.plazo + ' días'],
+        ['Días con balance negativo', e.diasNegativos],
+        ['Balance al cierre', cantidadResumen(e.balanceFinal)],
+        ['Disponible al cierre', cantidadResumen(e.disponibleFinal)],
+        ['Pendiente al cierre', cantidadResumen(e.pendienteFinal)],
+      ]} />
+    </section>)}
+
+    <section aria-labelledby={prefijo + '-interpretacion'}>
+      <h4 id={prefijo + '-interpretacion'}>Cómo interpretar el resultado</h4>
+      <p>La cantidad calculada sigue la regla Q = max(0, D15 + reserva − inventario inicial).
+        La recepción se simula al inicio del día posterior a cumplir el plazo (L + 1).
+        Q es independiente del plazo. Un plazo más largo puede aumentar la demanda pendiente antes de la recepción.</p>
+      <p>Un balance negativo indica demanda pendiente simulada. Las existencias físicas y las ventas perdidas
+        requieren datos observados. El resultado es hipotético y no genera una orden de compra.</p>
+      <p className="help-text">≈ indica un valor abreviado en el resumen. Un saldo muy pequeño puede deberse a la precisión
+        numérica. Consulte las cantidades completas disponibles y las advertencias originales en el detalle técnico.</p>
+    </section>
+    <details className="simulaciones-detalle-tecnico" key={datos.id}>
+      <summary>Ver detalle técnico y trayectoria de 15 días</summary>
+      <Detalle datos={datos} prefijo={prefijo + '-detalle'} />
+    </details>
+  </section>
+}
+
+function Detalle({ datos, prefijo }: { datos: ReturnType<typeof leerDetalle>; prefijo: string }) {
   return <section className="simulaciones-detalle" aria-labelledby={prefijo}>
-    <h3 id={prefijo}>Ejecución {datos.id}</h3>
+    <h4 id={prefijo}>Datos técnicos de la ejecución {datos.id}</h4>
     <Datos campos={[
       ['Registro UTC', <time dateTime={datos.registro}>{datos.registro}</time>],
       ['Modalidad', nombreModalidad(datos.modalidad)], ['Escenarios', datos.numero],
@@ -300,14 +382,14 @@ function Detalle({ datos, prefijo = 'simulaciones-detalle' }: { datos: ReturnTyp
     <Notas titulo="Advertencias de la ejecución" notas={datos.advertencias} />
     <p className="help-text">Las cantidades enteras que exceden el rango seguro del navegador se omiten. Los valores se muestran con la precisión numérica disponible en el navegador.</p>
     {datos.escenarios.map(e => <section className="simulaciones-escenario" key={e.etiqueta} aria-label={'Escenario ' + e.etiqueta}>
-      <h4>Escenario {e.etiqueta}</h4>
+      <h5>Escenario {e.etiqueta}</h5>
       <Datos campos={[
         ['Inventario hipotético inicial', numero(e.parametros.inventario)], ['Plazo de abastecimiento', e.parametros.plazo + ' días'],
         ['Reserva', numero(e.parametros.reserva)], ['Demanda considerada', numero(e.demanda)],
         ['Reposición Q', numero(e.reposicion)], ['Fecha de recepción', e.recepcion],
         ['Recepción dentro del horizonte', e.dentro ? 'Sí' : 'No'],
       ]} />
-      <h5>Resumen final</h5>
+      <h6>Resumen final</h6>
       <Datos campos={[
         ['Balance neto final', numero(e.balanceFinal)], ['Disponible hipotético final', numero(e.disponibleFinal)],
         ['Demanda pendiente final', numero(e.pendienteFinal)], ['Mayor demanda pendiente', numero(e.mayorPendiente)],
@@ -456,7 +538,7 @@ function Historial({ control }: { control: Ref<ControlHistorial> }) {
       <p role="status">Seleccione una ejecución para consultar su detalle.</p>}
     {detalle.tipo === 'cargando' && <p role="status">Cargando detalle de la ejecución {seleccion}…</p>}
     {detalle.tipo === 'error' && <p role="alert">{detalle.mensaje}</p>}
-    {detalle.tipo === 'listo' && <Detalle datos={detalle.datos} />}
+    {detalle.tipo === 'listo' && <Resultado datos={detalle.datos} />}
   </section>
 }
 
@@ -822,7 +904,7 @@ export default function Simulaciones({ activo, seleccion, selector }: Props) {
       {visible && <div className="simulaciones-pendiente">
         <p role="status">{visible.creado ? 'Ejecución creada' : 'Ejecución reutilizada'} · ID {visible.fila.id}.</p>
         <button type="button" onClick={() => { void historial.current?.abrir(visible.fila) }}>Consultar detalle registrado</button>
-        <details><summary>Ver resultado confirmado</summary><Detalle datos={visible.datos} prefijo="simulaciones-confirmada" /></details>
+        <Resultado datos={visible.datos} prefijo="simulaciones-confirmada" />
       </div>}
     </section>
     <Historial control={historial} />
