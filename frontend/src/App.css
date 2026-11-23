@@ -1236,3 +1236,31 @@
     display: block;
   }
 }
+
+.simulaciones-ficha-pronostico {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+  padding: clamp(12px, 3vw, 18px);
+  border: 1px solid var(--border);
+  border-inline-start: 3px solid var(--accent-border);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+
+.simulaciones-ficha-pronostico h3 {
+  margin-block: 0 8px;
+}
+
+.simulaciones-ficha-pronostico summary {
+  margin-block-start: 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.simulaciones-ficha-fechas {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 24px;
+  padding-inline-start: 20px;
+}

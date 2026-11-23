@@ -883,6 +883,138 @@ async function enviar(intencion: Intencion) {
   return { tipo: 'desconocido', mensaje } as const
 }
 
+const HORIZONTE_EVALUACION = 15
+const FORMATO_COBERTURA = new Intl.NumberFormat('es-EC', { style: 'percent', maximumFractionDigits: 2 })
+const ERRORES_CONSULTA_EVALUACION: Record<number, string> = {
+  404: 'La evaluación de este pronóstico no está disponible en el conjunto activo.',
+  409: 'La evaluación no se puede consultar para el estado actual del conjunto o de las observaciones.',
+  503: 'El servicio de evaluación no está disponible. Puede reintentar la consulta.',
+}
+
+function fechasEvaluacion(corte: string) {
+  const inicio = Date.parse(corte + 'T00:00:00Z')
+  return Array.from({ length: HORIZONTE_EVALUACION }, (_, i) =>
+    new Date(inicio + (i + 1) * 86400000).toISOString().slice(0, 10))
+}
+
+function leerEvaluacionPronostico(valor: unknown, seleccion: SeleccionActiva, pronostico: Pronostico, fechas: string[]) {
+  const d = objeto(valor)
+  const origen = serie(d.serie)
+  verificar(d.conjunto_id === seleccion.conjuntoId && origen.id === seleccion.serie.id &&
+    origen.tienda === seleccion.serie.store_nbr && origen.familia === seleccion.serie.family &&
+    mismaIdentidad(identidad(d), pronostico) && d.horizonte === HORIZONTE_EVALUACION)
+
+  const e = objeto(d.evaluacion)
+  verificar(e.fecha_corte === pronostico.corte && e.horizonte === HORIZONTE_EVALUACION)
+  const observaciones = entero(e.observaciones_evaluadas, 0, HORIZONTE_EVALUACION)
+  const sinRegistro = entero(e.fechas_sin_registro, 0, HORIZONTE_EVALUACION)
+  const cobertura = cantidad(e.cobertura)
+  const ausentes = arreglo(e.fechas_ausentes, fecha)
+  const estado = observaciones === 0 ? 'sin_observaciones' : sinRegistro === 0 ? 'completa' : 'parcial'
+  verificar(observaciones + sinRegistro === HORIZONTE_EVALUACION &&
+    cobertura === observaciones / HORIZONTE_EVALUACION && ausentes.length === sinRegistro &&
+    new Set(ausentes).size === sinRegistro && ausentes.every(dia => fechas.includes(dia)) &&
+    d.estado_cobertura === estado)
+
+  const mae = e.mae === null ? null : cantidad(e.mae)
+  const wape = e.wape === null ? null : cantidad(e.wape)
+  const rmse = e.rmse === null ? null : cantidad(e.rmse)
+  verificar(observaciones ? mae !== null && rmse !== null : mae === null && wape === null && rmse === null)
+  return { estado, alcance: texto(d.alcance_metricas), mae, wape, rmse, observaciones, sinRegistro, cobertura, ausentes }
+}
+
+async function consultarEvaluacionPronostico(
+  seleccion: SeleccionActiva, pronostico: Pronostico, fechas: string[], signal: AbortSignal,
+): Promise<Estado<ReturnType<typeof leerEvaluacionPronostico>>> {
+  let respuesta: Response
+  try {
+    respuesta = await fetch('/api/evaluaciones/active/' + pronostico.pronostico, { method: 'GET', cache: 'no-store', signal })
+  } catch {
+    return { tipo: 'error', mensaje: 'No se pudo conectar con el servicio de evaluación. Revise la conexión y vuelva a intentarlo.' }
+  }
+  if (!respuesta.ok) {
+    const mensaje = ERRORES_CONSULTA_EVALUACION[respuesta.status] ?? 'No se pudo completar la consulta de métricas.'
+    return { tipo: 'error', mensaje: mensaje + ' (HTTP ' + respuesta.status + ')' }
+  }
+  try {
+    const datos = leerEvaluacionPronostico(await respuesta.json(), seleccion, pronostico, fechas)
+    return { tipo: 'listo', datos }
+  } catch {
+    return { tipo: 'error', mensaje: 'La respuesta de evaluación no corresponde al pronóstico seleccionado o contiene datos incoherentes.' }
+  }
+}
+
+function FichaPronostico({ seleccion, pronostico }: { seleccion: SeleccionActiva; pronostico: Pronostico }) {
+  const id = useId()
+  const [evaluacion, setEvaluacion] = useState<Estado<ReturnType<typeof leerEvaluacionPronostico>>>({ tipo: 'inicial' })
+  const consulta = useRef<AbortController | null>(null)
+  const fechas = fechasEvaluacion(pronostico.corte)
+
+  useEffect(() => () => {
+    consulta.current?.abort()
+    consulta.current = null
+  }, [])
+
+  async function consultar() {
+    if (consulta.current) return
+    const controlador = new AbortController()
+    consulta.current = controlador
+    setEvaluacion({ tipo: 'cargando' })
+    const resultado = await consultarEvaluacionPronostico(seleccion, pronostico, fechas, controlador.signal)
+    if (consulta.current !== controlador || controlador.signal.aborted) return
+    consulta.current = null
+    setEvaluacion(resultado)
+  }
+
+  const e = evaluacion.tipo === 'listo' ? evaluacion.datos : null
+  return <section className="simulaciones-ficha-pronostico" aria-labelledby={id + '-titulo'}>
+    <h3 id={id + '-titulo'}>Pronóstico seleccionado</h3>
+    <p><strong>Tienda {seleccion.serie.store_nbr} · {seleccion.serie.family}</strong></p>
+    <Datos campos={[
+      ['Pronóstico', pronostico.pronostico], ['Experimento', pronostico.experimento],
+      ['Técnica predictiva', pronostico.tecnica], ['Corte de validación', <FechaResumen iso={pronostico.corte} />],
+      ['Período objetivo (15 días)', <><FechaResumen iso={fechas[0]} /> a <FechaResumen iso={fechas[fechas.length - 1]} /></>],
+    ]} />
+    <p>La predicción estima la demanda agregada de una familia en una tienda. Los escenarios A, B y C comparten este
+      pronóstico y representan distintas condiciones hipotéticas de inventario.</p>
+    <h4>Métricas de validación</h4>
+    <p>La consulta es una evaluación actual por GET y no guarda resultados. Un error menor en este corte no demuestra
+      un mejor desempeño general.</p>
+    <button type="button" disabled={evaluacion.tipo === 'cargando'} onClick={() => { void consultar() }}>
+      {evaluacion.tipo === 'error' ? 'Reintentar consulta de métricas' :
+        evaluacion.tipo === 'listo' ? 'Actualizar métricas' : 'Consultar métricas'}
+    </button>
+    {evaluacion.tipo === 'cargando' && <p role="status">Consultando métricas del pronóstico…</p>}
+    {evaluacion.tipo === 'error' && <p role="alert">{evaluacion.mensaje}</p>}
+    {e && <>
+      <p role="status"><strong>Cobertura {e.estado === 'sin_observaciones' ? 'sin observaciones' : e.estado}.</strong>{' '}
+        {e.alcance}</p>
+      {e.estado === 'sin_observaciones' && <p>Sin ventas observadas, no se puede determinar el error predictivo.</p>}
+      <Datos campos={[
+        ['MAE', e.mae === null ? 'No definido' : cantidadResumen(e.mae)],
+        ['WAPE (%)', e.wape === null ? 'No definido' : cantidadResumen(e.wape)],
+        ['RMSE', e.rmse === null ? 'No definido' : cantidadResumen(e.rmse)],
+        ['Observaciones evaluadas', e.observaciones + ' / ' + HORIZONTE_EVALUACION],
+        ['Cobertura', FORMATO_COBERTURA.format(e.cobertura)],
+        ['Fechas sin registro', e.sinRegistro],
+      ]} />
+      {e.ausentes.length > 0 && <>
+        <p>Fechas sin ventas observadas</p>
+        <ul className="simulaciones-ficha-fechas">{e.ausentes.map(dia => <li key={dia}><FechaResumen iso={dia} /></li>)}</ul>
+      </>}
+    </>}
+    <details>
+      <summary>Cómo leer las métricas</summary>
+      <Datos campos={[
+        ['MAE', 'Error absoluto medio.'],
+        ['WAPE', 'Error porcentual absoluto ponderado. No es un porcentaje de acierto. Puede quedar indefinido si no hay observaciones o si sus ventas suman cero.'],
+        ['RMSE', 'Raíz del error cuadrático medio. Da mayor peso a los errores grandes.'],
+        ['Cobertura', 'Proporción de fechas con ventas observadas para evaluar. Con cobertura parcial, las métricas describen solo las observaciones disponibles.'],
+      ]} />
+    </details>
+  </section>
+}
+
 function FormularioSimulacion({ seleccion, bloqueado, registrar }: {
   seleccion: SeleccionActiva; bloqueado: boolean; registrar: (intencion: Intencion) => void
 }) {
@@ -932,6 +1064,7 @@ function FormularioSimulacion({ seleccion, bloqueado, registrar }: {
     {lista.tipo === 'listo' && lista.datos.length > 0 && <form className="simulaciones-formulario" onSubmit={guardar} noValidate>
       <fieldset disabled={bloqueado}>
         <legend>Pronóstico y modalidad</legend>
+        <p className="help-text">Elija un corte según las fechas que desea simular. El sistema no selecciona un modelo ganador.</p>
         <label>Pronóstico de validación
           <select value={id} onChange={e => { setId(e.target.value); setError('') }}>
             <option value="">Seleccione un pronóstico</option>
@@ -949,6 +1082,7 @@ function FormularioSimulacion({ seleccion, bloqueado, registrar }: {
           <input type="checkbox" checked={tercero} onChange={e => { setTercero(e.target.checked); setError('') }} /> Incluir escenario C
         </label>}
       </fieldset>
+      {pronostico && <FichaPronostico key={'evaluacion-' + pronostico.pronostico} seleccion={seleccion} pronostico={pronostico} />}
       {campos.slice(0, numeroEscenarios).map((escenario, i) =>
         <fieldset disabled={bloqueado} key={i} aria-describedby="simulaciones-parametros-ayuda">
           <legend>Escenario {'ABC'[i]}</legend>
