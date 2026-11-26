@@ -5,9 +5,9 @@ import type { DestinoSimulacion } from './Simulaciones'
 type Seleccion = { conjuntoId: number; serie: SerieTemporal }
 type Props = { seleccion: Seleccion | null; activo: boolean; simular: (destino: DestinoSimulacion) => void }
 const TECNICAS = [
-  { id: 'estacional_semanal_recursiva', nombre: 'Línea base estacional semanal' },
-  { id: 'random_forest', nombre: 'Random Forest' },
-  { id: 'hist_gradient_boosting', nombre: 'HistGradientBoosting' },
+  { id: 'estacional_semanal_recursiva', nombre: 'Línea base estacional semanal', ayuda: 'Usa el patrón de ventas de la semana anterior para estimar el día equivalente.' },
+  { id: 'random_forest', nombre: 'Random Forest', ayuda: 'Promedia las estimaciones de varios árboles que aprenden patrones de las ventas históricas.' },
+  { id: 'hist_gradient_boosting', nombre: 'HistGradientBoosting', ayuda: 'Combina árboles construidos en secuencia. Cada etapa intenta corregir errores de las anteriores.' },
 ] as const
 const CORTES = ['2017-06-16', '2017-07-01', '2017-07-16'] as const
 type Tecnica = typeof TECNICAS[number]['id']
@@ -391,6 +391,13 @@ function esDetalle(value: unknown, seleccion: Seleccion, esperado: Referencia): 
     fila.paso === indice + 1 && fila.fecha_objetivo === fechaFutura(p.fecha_corte, indice + 1) &&
     typeof fila.venta_estimada === 'number' && Number.isFinite(fila.venta_estimada) && fila.venta_estimada >= 0)
 }
+function mismaIdentidadPronostico(a: Metadatos, b: Metadatos): boolean {
+  return a.id === b.id && a.experimento_id === b.experimento_id && a.tecnica === b.tecnica &&
+    a.fecha_corte === b.fecha_corte && a.tipo === b.tipo && a.horizonte === b.horizonte &&
+    a.fecha_generacion === b.fecha_generacion && a.inicio_entrenamiento === b.inicio_entrenamiento &&
+    a.fin_entrenamiento === b.fin_entrenamiento
+}
+
 function esConfiguracionGuardada(value: unknown, seleccion: Seleccion, esperado: Metadatos): value is ConfiguracionGuardada {
   if (!registro(value) || !mismaSeleccion(value, seleccion) || value.pronostico_id !== esperado.id ||
       value.experimento_id !== esperado.experimento_id || value.fecha_corte !== esperado.fecha_corte ||
@@ -684,10 +691,14 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   const [lista, setLista] = useState<EstadoLista>({ kind: 'loading' })
   const [filtroTecnica, setFiltroTecnica] = useState<Tecnica | ''>('')
   const [filtroCorte, setFiltroCorte] = useState<Corte | ''>('')
-  const filasFiltradas = lista.kind === 'success' ? lista.filas.filter(p =>
-    (!filtroTecnica || p.tecnica === filtroTecnica) && (!filtroCorte || p.fecha_corte === filtroCorte)) : []
+  const coincideFiltro = (p: Metadatos) =>
+    (!filtroTecnica || p.tecnica === filtroTecnica) && (!filtroCorte || p.fecha_corte === filtroCorte)
+  const filasFiltradas = lista.kind === 'success' ? lista.filas.filter(coincideFiltro) : []
   const [detalle, setDetalle] = useState<EstadoDetalle>({ kind: 'idle' })
   const [seleccionComparacion, setSeleccionComparacion] = useState<Metadatos[]>([])
+  const seleccionActual = useRef<Metadatos[]>([])
+  const [retirados, setRetirados] = useState<number[]>([])
+  const tituloComparacion = useRef<HTMLHeadingElement>(null)
   const [comparacion, setComparacion] = useState<EstadoComparacion>({ kind: 'idle' })
   const [configuracionGuardada, setConfiguracionGuardada] = useState<EstadoConfiguracion>({ kind: 'idle' })
   const [generacion, setGeneracion] = useState<EstadoGeneracion>({ kind: 'idle' })
@@ -718,7 +729,6 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   }, [])
 
   const consultarLista = useCallback(async () => {
-    invalidarComparacion()
     solicitudLista.current?.abort()
     const controller = new AbortController()
     solicitudLista.current = controller
@@ -734,15 +744,25 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
         throw new ErrorSolicitud('El listado recibido no corresponde a la serie y conjunto seleccionados o contiene datos inválidos.')
       }
       const filas = body.pronosticos.filter(esElegibleEnListado)
-      setSeleccionComparacion(anterior => anterior.flatMap(p => {
-        const vigente = filas.find(fila => fila.id === p.id && fila.experimento_id === p.experimento_id &&
-          fila.tecnica === p.tecnica && fila.fecha_corte === p.fecha_corte)
-        return vigente ? [vigente] : []
-      }))
+      const anterior = seleccionActual.current
+      const porId = new Map(filas.map(fila => [fila.id, fila]))
+      const confirmados = anterior.filter(p => {
+        const fila = porId.get(p.id)
+        return fila !== undefined && mismaIdentidadPronostico(fila, p)
+      })
+      if (confirmados.length !== anterior.length) {
+        invalidarComparacion()
+        seleccionActual.current = confirmados
+        setSeleccionComparacion(confirmados)
+      }
+      setRetirados(anterior.filter(p => !confirmados.includes(p)).map(p => p.id))
       setLista({ kind: 'success', filas, total: body.pronosticos.length })
     } catch (error) {
-      if (vivo.current && !controller.signal.aborted) setLista({ kind: 'error', message:
-        mensajeError(error, 'No se pudo conectar para consultar los pronósticos almacenados.') })
+      if (vivo.current && !controller.signal.aborted) {
+        invalidarComparacion()
+        setLista({ kind: 'error', message:
+          mensajeError(error, 'No se pudo conectar para consultar los pronósticos almacenados.') })
+      }
     } finally {
       if (solicitudLista.current === controller) solicitudLista.current = null
     }
@@ -773,12 +793,6 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
     } finally {
       if (solicitudDetalle.current === controller) solicitudDetalle.current = null
     }
-  }
-
-  function cerrarConfiguracion() {
-    solicitudConfiguracion.current?.abort()
-    solicitudConfiguracion.current = null
-    setConfiguracionGuardada({ kind: 'idle' })
   }
 
   async function consultarConfiguracion(esperado: Metadatos) {
@@ -819,24 +833,20 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   }
 
   function cambiarSeleccionComparacion(p: Metadatos, agregar: boolean) {
-    if (agregar && (motivoComparacion(p) || seleccionComparacion.some(item => item.id === p.id))) return
+    const anterior = seleccionActual.current
+    const existe = anterior.some(item => item.id === p.id)
+    if (agregar === existe ||
+        (agregar && (lista.kind !== 'success' || solicitudLista.current || motivoComparacion(p, anterior)))) return
+    const siguiente = agregar ? [...anterior, p] : anterior.filter(item => item.id !== p.id)
     invalidarComparacion()
-    setSeleccionComparacion(anterior => {
-      if (!agregar) return anterior.filter(item => item.id !== p.id)
-      return motivoComparacion(p, anterior) || anterior.some(item => item.id === p.id) ? anterior : [...anterior, p]
-    })
-  }
-
-  function filtrarSeleccionComparacion(tecnicaHistorial: Tecnica | '', corteHistorial: Corte | '') {
-    invalidarComparacion()
-    setSeleccionComparacion(anterior => anterior.filter(p =>
-      (!tecnicaHistorial || p.tecnica === tecnicaHistorial) && (!corteHistorial || p.fecha_corte === corteHistorial)))
+    seleccionActual.current = siguiente
+    setSeleccionComparacion(siguiente)
   }
 
   async function consultarComparacion() {
-    if (lista.kind !== 'success' || seleccionComparacion.length < 2 || seleccionComparacion.length > 3 ||
+    const esperados = seleccionActual.current
+    if (lista.kind !== 'success' || solicitudLista.current || esperados.length < 2 || esperados.length > 3 ||
         solicitudComparacion.current !== null) return
-    const esperados = [...seleccionComparacion]
     const controller = new AbortController()
     solicitudComparacion.current = controller
     setComparacion({ kind: 'loading' })
@@ -849,7 +859,8 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
         const body = await leerRespuesta(response, codigo => codigo === 'error_interno'
           ? 'Ocurrió un error interno al consultar el pronóstico.'
           : Object.hasOwn(ERRORES_CONFIGURACION, codigo) ? ERRORES_CONFIGURACION[codigo] : undefined)
-        if (response.status !== 200 || !esDetalle(body, seleccion, esperado)) {
+        if (response.status !== 200 || !esDetalle(body, seleccion, esperado) ||
+            !mismaIdentidadPronostico(body.pronostico, esperado)) {
           throw new ErrorSolicitud('Los datos recibidos no corresponden a los pronósticos seleccionados o contienen estimaciones inválidas.')
         }
         return body
@@ -937,10 +948,12 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
   return (
     <>
       <p className="forecast-series">Tienda <strong>{tienda}</strong> · Familia <strong>{familia}</strong></p>
+      <h3>Generar un pronóstico individual</h3>
+      <p>Elija una técnica y un corte. Puede comenzar con los valores predeterminados.</p>
       <form className="forecast-form" onSubmit={event => { void generar(event) }} aria-busy={pendiente}>
         <div>
           <label htmlFor="forecast-technique">Técnica</label>
-          <select id="forecast-technique" value={tecnica} disabled={pendiente}
+          <select id="forecast-technique" value={tecnica} disabled={pendiente} aria-describedby="forecast-technique-help"
             onChange={event => {
               if (!pendiente && esTecnica(event.target.value)) {
                 setTecnica(event.target.value)
@@ -949,10 +962,11 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
             }}>
             {TECNICAS.map(t => <option key={t.id} value={t.id}>{t.nombre}</option>)}
           </select>
+          <p id="forecast-technique-help" className="help-text">{TECNICAS.find(t => t.id === tecnica)?.ayuda}</p>
         </div>
         <div>
           <label htmlFor="forecast-cutoff">Fecha de corte</label>
-          <select id="forecast-cutoff" value={corte} disabled={pendiente}
+          <select id="forecast-cutoff" value={corte} disabled={pendiente} aria-describedby="forecast-cutoff-help forecast-target-range"
             onChange={event => {
               if (!pendiente && esCorte(event.target.value)) {
                 setCorte(event.target.value)
@@ -961,6 +975,9 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
             }}>
             {CORTES.map((c, i) => <option key={c} value={c}>{c} · Validación {i + 1}</option>)}
           </select>
+          <p id="forecast-cutoff-help" className="help-text">El corte es el último día del período disponible para entrenar.</p>
+          <p id="forecast-target-range" className="help-text" role="status">Período objetivo de 15 días:{' '}
+            <strong>{fechaFutura(corte, 1)} a {fechaFutura(corte, 15)}</strong>.</p>
         </div>
         <div className="forecast-variable-group">
           <label htmlFor="forecast-variable-group">Grupo de variables predictoras</label>
@@ -1121,8 +1138,6 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
               const valor = event.target.value
               if (valor === '' || esTecnica(valor)) {
                 setFiltroTecnica(valor)
-                cerrarConfiguracion()
-                filtrarSeleccionComparacion(valor, filtroCorte)
               }
             }}>
               <option value="">Todas las técnicas</option>
@@ -1135,8 +1150,6 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
               const valor = event.target.value
               if (valor === '' || esCorte(valor)) {
                 setFiltroCorte(valor)
-                cerrarConfiguracion()
-                filtrarSeleccionComparacion(filtroTecnica, valor)
               }
             }}>
               <option value="">Todos los cortes</option>
@@ -1144,6 +1157,7 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
             </select>
           </div>
         </div>
+        <p>Consulte el pronóstico diario o su configuración guardada. Los filtros solo cambian las filas visibles.</p>
         {lista.kind === 'loading' && <p role="status">Cargando pronósticos almacenados…</p>}
         {lista.kind === 'error' && <p className="forecast-message forecast-message--error" role="alert">{lista.message}</p>}
         {lista.kind === 'success' && (lista.filas.length === 0
@@ -1188,16 +1202,32 @@ function PanelPronosticos({ seleccion, activo, pendiente, revision, iniciar, fin
         {configuracionGuardada.kind === 'success' && <ConfiguracionPronostico
           pronostico={configuracionGuardada.pronostico} data={configuracionGuardada.data} />}
       </section>
-      <section className="forecast-results" aria-labelledby="forecast-comparison-heading" aria-busy={comparacion.kind === 'loading'}>
-        <h3 id="forecast-comparison-heading">Comparación visual de pronósticos almacenados</h3>
-        <p>Seleccione dos o tres pronósticos de experimentos diferentes y del mismo corte en el historial.</p>
-        <p role="status">Seleccionados {seleccionComparacion.length} de 3
-          {seleccionComparacion.length > 0 && ` · Corte ${seleccionComparacion[0].fecha_corte} · Pronósticos ${seleccionComparacion.map(p => p.id).join(', ')}`}.</p>
+      <section className="forecast-results" aria-labelledby="forecast-comparison-heading" aria-busy={lista.kind === 'success' && comparacion.kind === 'loading'}>
+        <h3 id="forecast-comparison-heading" ref={tituloComparacion} tabIndex={-1}>Comparación visual de pronósticos almacenados</h3>
+        <p>Marque dos o tres pronósticos del mismo corte y de experimentos distintos para superponer sus estimaciones.
+          Para medir el error frente a las ventas observadas, vaya a <strong>Comparación</strong>.</p>
+        <p role="status">Seleccionados {seleccionComparacion.length} de 3.</p>
+        {seleccionComparacion.length > 0 && <>
+          <p className="help-text">Para comparar otro corte, retire todas las elecciones de esta lista.</p>
+          <ul aria-label="Pronósticos seleccionados">{seleccionComparacion.map(p => <li key={p.id}>
+            <span>{nombreTecnica(p.tecnica)} · Corte {p.fecha_corte} · Pronóstico {p.id} · Experimento {p.experimento_id}
+              {!coincideFiltro(p) && <strong> · Fuera del filtro</strong>}</span>{' '}
+            <button type="button" aria-label={`Retirar pronóstico ${p.id}`} onClick={() => {
+              cambiarSeleccionComparacion(p, false)
+              tituloComparacion.current?.focus()
+            }}>Retirar</button>
+          </li>)}</ul>
+          {lista.kind !== 'success' && <p role="status">{lista.kind === 'loading' ?
+            'Confirmando la selección con el listado actualizado…' :
+            'No se pudo confirmar la selección. Actualice el listado antes de comparar.'}</p>}
+        </>}
+        {retirados.length > 0 && <p role="status">Se retiraron de la selección los pronósticos {retirados.join(', ')}
+          {' '}porque ya no están disponibles con la misma identidad.</p>}
         <button type="button" disabled={lista.kind !== 'success' || seleccionComparacion.length < 2 || comparacion.kind === 'loading'}
           onClick={() => { void consultarComparacion() }}>Comparar pronósticos seleccionados</button>
-        {comparacion.kind === 'loading' && <p role="status">Consultando todos los pronósticos seleccionados…</p>}
-        {comparacion.kind === 'error' && <p role="alert" className="forecast-message forecast-message--error">{comparacion.message}</p>}
-        {comparacion.kind === 'success' && <GraficoComparacion datos={comparacion.datos} />}
+        {lista.kind === 'success' && comparacion.kind === 'loading' && <p role="status">Consultando todos los pronósticos seleccionados…</p>}
+        {lista.kind === 'success' && comparacion.kind === 'error' && <p role="alert" className="forecast-message forecast-message--error">{comparacion.message}</p>}
+        {lista.kind === 'success' && comparacion.kind === 'success' && <GraficoComparacion datos={comparacion.datos} />}
       </section>
       {detalle.kind === 'loading' && <p className="forecast-message" role="status">Consultando detalle del pronóstico…</p>}
       {detalle.kind === 'error' && <p className="forecast-message forecast-message--error" role="alert">{detalle.message}</p>}
@@ -1263,7 +1293,7 @@ function PronosticosVentas({ seleccion, activo, simular }: Props) {
     </div>}
     {seleccion === null
       ? <p role="status">Seleccione una tienda y una familia válidas para consultar o generar pronósticos.</p>
-      : <PanelPronosticos key={`${seleccion.conjuntoId}:${seleccion.serie.id}`} seleccion={seleccion}
+      : <PanelPronosticos key={JSON.stringify([seleccion.conjuntoId, seleccion.serie.id, seleccion.serie.store_nbr, seleccion.serie.family])} seleccion={seleccion}
         activo={activo} pendiente={generando !== null} revision={revision} iniciar={iniciar} finalizar={finalizar} simular={simular} />}
   </section>
 }

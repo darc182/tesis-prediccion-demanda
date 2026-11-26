@@ -522,6 +522,7 @@
 .forecast-series { margin-bottom: 20px; overflow-wrap: anywhere; }
 .forecast-series strong { color: var(--text-h); }
 .forecast-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 16px; align-items: end; }
+form.forecast-form > div:has(> :is(#forecast-technique, #forecast-cutoff)) { align-self: start; }
 .forecast-form label { display: block; margin-bottom: 8px; color: var(--text-h); font-weight: 600; }
 .forecast-form select, .forecast-form input { box-sizing: border-box; width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-h); background: var(--bg); font: inherit; }
 .forecast-form .help-text { grid-column: 1 / -1; }
