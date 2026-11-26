@@ -28,7 +28,7 @@ type Reporte = {
 type PerfilGlobal = { conjunto_id: number; version_perfil: 1; sha256_csv: string; series_importadas: number; observaciones_importadas: number; reporte: Reporte }
 type Props = { conjuntoIdActivo: number | null; estadoConjunto: SeriesState['kind']; activo: boolean; actualizarSeries: () => void }
 type Estado = { kind: 'idle' } | { kind: 'loading'; signal: AbortSignal } | { kind: 'success'; datos: PerfilGlobal } |
-  { kind: 'error'; titulo: string; mensaje: string; actualizar?: boolean }
+  { kind: 'no-disponible' } | { kind: 'error'; titulo: string; mensaje: string; actualizar?: boolean }
 
 const DIA = 86_400_000
 const PAGINA = 25
@@ -187,8 +187,11 @@ function TablaPaginada<T>({ titulo, filas, columnas }: { titulo: string; filas: 
       <button type="button" disabled={actual + 1 === paginas} onClick={() => setPagina(actual + 1)} aria-label={`Página siguiente: ${titulo}`}>Siguiente</button>
     </div>}</div>
 }
+// Mensaje público del contrato de GET /api/datasets/active/perfil-global.
+const PERFIL_NO_DISPONIBLE = 'El conjunto activo no dispone de un perfil global.'
+
 function mensajeHTTP(status: number, body: unknown): string {
-  if (status === 404) return 'El conjunto activo no tiene un perfil global. Los conjuntos anteriores a esta función pueden carecer de reporte; no se reconstruye desde las diez series.'
+  if (status === 404) return 'No se pudo confirmar si el conjunto tiene un panorama global. El servidor no reconoció la consulta.'
   if (status === 409) return objeto(body) && body.detail === 'No existe un conjunto de datos activo.'
     ? 'No existe un conjunto activo. Actualice la consulta de series.'
     : 'El perfil almacenado es inconsistente, supera el límite permitido o utiliza una versión no compatible.'
@@ -228,7 +231,9 @@ export default function PerfilGlobalDatos({ conjuntoIdActivo, estadoConjunto, ac
         return
       }
       if (!vigente()) return
-      if (!response.ok) setEstado({ kind: 'error', titulo: `Error HTTP ${response.status}`, mensaje: mensajeHTTP(response.status, body), actualizar: response.status === 409 })
+      if (response.status === 404 && objeto(body) && body.detail === PERFIL_NO_DISPONIBLE) {
+        setEstado({ kind: 'no-disponible' })
+      } else if (!response.ok) setEstado({ kind: 'error', titulo: `Error HTTP ${response.status}`, mensaje: mensajeHTTP(response.status, body), actualizar: response.status === 409 })
       else if (!esPerfilGlobal(body)) setEstado({ kind: 'error', titulo: 'Respuesta incompatible', mensaje: 'El reporte tiene una estructura o agregados inconsistentes. No se muestran estadísticas.', actualizar: true })
       else if (body.conjunto_id !== esperado) setEstado({ kind: 'error', titulo: 'Respuesta incompatible', mensaje: 'El conjunto activo cambió. Actualice la consulta de series antes de consultar nuevamente.', actualizar: true })
       else setEstado({ kind: 'success', datos: body })
@@ -249,6 +254,14 @@ export default function PerfilGlobalDatos({ conjuntoIdActivo, estadoConjunto, ac
     {confirmado && estado.kind === 'idle' && <p className="global-profile-note">Listo para consultar el conjunto {conjuntoIdActivo}. No se solicita el panorama automáticamente.</p>}
     {cargando && <p role="status" className="global-profile-note">Consultando panorama global…</p>}
     {confirmado && estado.kind === 'loading' && !cargando && activo && <p role="status" className="global-profile-note">Consulta cancelada. Puede solicitar el panorama nuevamente.</p>}
+    {confirmado && activo && estado.kind === 'no-disponible' && <div className="global-profile-note">
+      <div role="status">
+        <strong>Panorama global no disponible para este conjunto</strong>
+        <p>No hay un reporte almacenado del archivo completo. El panorama no se puede reconstruir a partir de las series importadas.</p>
+        <p>Puede continuar en <strong>Histórico</strong> y utilizar las demás funciones con las series activas.</p>
+      </div>
+      <details><summary>Ver detalle técnico</summary><p>HTTP 404 · {PERFIL_NO_DISPONIBLE}</p></details>
+    </div>}
     {confirmado && activo && estado.kind === 'error' && <div role="alert" className="global-profile-error"><strong>{estado.titulo}</strong><p>{estado.mensaje}</p><p>Puede reintentar con «Consultar panorama global».</p></div>}
     {datos && r && <div key={`${datos.conjunto_id}:${datos.sha256_csv}`}>
       <h3>Identidad y procedencia</h3>

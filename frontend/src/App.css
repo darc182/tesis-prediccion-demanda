@@ -124,6 +124,28 @@
   gap: 12px;
 }
 
+.upload-card > p + p {
+  margin-top: 10px;
+}
+
+.upload-format {
+  margin-block: 20px;
+}
+
+.upload-format dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 12px;
+}
+
+.upload-format dd {
+  margin: 0;
+}
+
+.upload-format p + p {
+  margin-top: 10px;
+}
+
 .upload-card label {
   color: var(--text-h);
   font-weight: 600;

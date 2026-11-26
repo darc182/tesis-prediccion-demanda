@@ -223,7 +223,7 @@ function App() {
     } catch {
       setUpload({
         kind: 'network-error',
-        message: 'No se pudo enviar el archivo. Compruebe la conexión con FastAPI e inténtelo de nuevo.',
+        message: 'Se perdió la conexión y no se pudo confirmar el resultado de la carga. Actualice las series antes de volver a enviar el archivo.',
       })
       setConnection('error')
       return
@@ -296,6 +296,9 @@ function App() {
   }
 
   const processing = upload.kind === 'processing'
+  const cargaSinConfirmar = upload.kind === 'network-error' || upload.kind === 'response-error'
+  const cargaActivaConfirmada = upload.kind === 'success' && seriesState.kind === 'available' &&
+    seriesState.conjuntoId === upload.result.conjunto_id
   const serieSeleccionada = seriesState.kind === 'available' &&
     selectedStore !== null && selectedFamily !== null
     ? seriesState.series.find((serie) =>
@@ -375,7 +378,35 @@ function App() {
 
       <section className="app-view" aria-label="Datos" hidden={vista !== 'datos'}>
         <section className="upload-card" aria-labelledby="upload-heading">
-          <h2 id="upload-heading">Seleccionar archivo</h2>
+          <h2 id="upload-heading">Cargar un conjunto de datos</h2>
+          <p>Cargue un archivo de ventas para consultar el histórico, generar pronósticos y simular escenarios de inventario.</p>
+          {seriesState.kind === 'available' && upload.kind !== 'success' && !processing && !cargaSinConfirmar &&
+            <p>Ya hay un conjunto activo con series disponibles. Puede continuar en <strong>Histórico</strong> sin cargar otro archivo.</p>}
+          <p id="upload-effect">
+            Si la carga se completa, el nuevo conjunto pasa a estar activo y sustituye al anterior como contexto de trabajo.
+            Los conjuntos anteriores se conservan almacenados.
+          </p>
+          <p>Se importan las observaciones de las combinaciones habilitadas de tienda y familia presentes en el CSV, hasta diez series.
+            El panorama global describe el archivo completo. Las demás funciones trabajan con las series importadas.</p>
+
+          <details className="upload-format profile-section">
+            <summary>Consultar formato y requisitos del archivo CSV</summary>
+            <p id="file-help">Use un CSV con encabezados, separado por comas. Incluya estas cinco columnas obligatorias en cualquier orden.
+              El archivo puede contener otras columnas.</p>
+            <dl>
+              <dt><code>date</code></dt><dd>Fecha de la venta en formato YYYY-MM-DD.</dd>
+              <dt><code>store_nbr</code></dt><dd>Número de tienda, un entero positivo.</dd>
+              <dt><code>family</code></dt><dd>Familia de producto, un texto no vacío.</dd>
+              <dt><code>sales</code></dt><dd>Ventas, un número finito y no negativo que puede ser fraccionario.</dd>
+              <dt><code>onpromotion</code></dt><dd>Conteo de promociones, un entero no negativo.</dd>
+            </dl>
+            <p id="csv-duplicates">Cada combinación de fecha, tienda y familia puede aparecer una sola vez.</p>
+            <p><strong>Ejemplo ilustrativo de encabezado y fila</strong><br />
+              <code>date,<wbr />store_nbr,<wbr />family,<wbr />sales,<wbr />onpromotion</code><br />
+              <code>2017-01-02,<wbr />17,<wbr />FAMILIA EJEMPLO,<wbr />12.5,<wbr />2</code>
+            </p>
+            <p>La fila solo ilustra el formato. Para entrenar o validar un modelo se necesita historial suficiente de la serie.</p>
+          </details>
           <form onSubmit={(event) => { void handleSubmit(event) }} aria-busy={processing}>
             <label htmlFor="csv-file">Archivo CSV</label>
             <input
@@ -383,21 +414,18 @@ function App() {
               type="file"
               accept=".csv,text/csv"
               disabled={processing}
-              aria-describedby="file-help"
+              aria-describedby="file-help csv-duplicates upload-effect"
               onChange={(event) => {
                 setFile(event.target.files?.[0] ?? null)
                 setUpload({ kind: 'idle' })
               }}
             />
-            <p id="file-help" className="help-text">
-              Se comprobarán el formato y las series disponibles al enviar el archivo.
-            </p>
             {file && (
               <p className="file-details">
                 Seleccionado: <strong>{file.name}</strong> · {formatoTamano(file.size)}
               </p>
             )}
-            <button type="submit" disabled={processing}>Cargar y validar datos</button>
+            <button type="submit" disabled={processing}>Validar y cargar conjunto de datos</button>
           </form>
         </section>
 
@@ -413,6 +441,9 @@ function App() {
           <section className="feedback feedback--error" role="alert">
             <h2>No se pudo completar la carga</h2>
             <p>{upload.message}</p>
+            {cargaSinConfirmar && <button type="button" disabled={seriesState.kind === 'loading'} onClick={handleRetrySeries}>
+              Actualizar series disponibles
+            </button>}
           </section>
         )}
 
@@ -431,6 +462,11 @@ function App() {
         {upload.kind === 'success' && (
           <section className="feedback feedback--success" role="status" aria-live="polite">
             <h2>Datos cargados correctamente</h2>
+            {cargaActivaConfirmada ? <p>Las series del nuevo conjunto están disponibles. Continúe en <strong>Histórico</strong>.</p> :
+              seriesState.kind === 'loading' ? <p>Confirmando las series del nuevo conjunto…</p> : <>
+                <p>Se completó la carga, pero aún no se pudo confirmar que las series del nuevo conjunto estén disponibles.</p>
+                <button type="button" onClick={handleRetrySeries}>Actualizar series disponibles</button>
+              </>}
             <dl className="result-summary">
               <div><dt>Conjunto</dt><dd>{upload.result.conjunto_id}</dd></div>
               <div><dt>Series importadas</dt><dd>{upload.result.series_importadas}</dd></div>
