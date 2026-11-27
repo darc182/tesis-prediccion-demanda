@@ -997,8 +997,7 @@ function FichaPronostico({ seleccion, pronostico }: { seleccion: SeleccionActiva
       ['Fecha de generación', mostrarFechaGeneracion(pronostico.candidato.fecha_generacion)],
       ['Período objetivo (15 días)', <><FechaResumen iso={fechas[0]} /> a <FechaResumen iso={fechas[fechas.length - 1]} /></>],
     ]} />
-    <p>La predicción estima la demanda agregada de una familia en una tienda. Los escenarios A, B y C comparten este
-      pronóstico y representan distintas condiciones hipotéticas de inventario.</p>
+    <p>La predicción estima la demanda agregada de una familia en una tienda.</p>
     <button type="button" aria-label={`Ver configuración del pronóstico ${pronostico.pronostico}`}
       disabled={inspector.consulta?.estado.kind === 'loading'}
       onClick={() => { void inspector.consultar(pronostico.candidato) }}>Ver configuración</button>
@@ -1127,21 +1126,43 @@ function FormularioSimulacion({ seleccion, bloqueado, registrar, transferencia, 
           </select>
         </label>
         <label>Modalidad de creación
-          <select value={modo} onChange={e => { setModo(e.target.value === 'comparacion' ? 'comparacion' : 'individual'); setError('') }}>
+          <select value={modo} aria-describedby="simulaciones-modalidad-ayuda"
+            onChange={e => { setModo(e.target.value === 'comparacion' ? 'comparacion' : 'individual'); setError('') }}>
             <option value="individual">Individual A</option><option value="comparacion">Comparación A/B</option>
           </select>
         </label>
+        <p id="simulaciones-modalidad-ayuda" className="help-text">Individual simula solo el escenario A. En comparación puede
+          usar A/B o incluir C. Todos comparten el mismo pronóstico y período, con condiciones de inventario que puede variar.</p>
         {modo === 'comparacion' && <label className="simulaciones-casilla">
           <input type="checkbox" checked={tercero} onChange={e => { setTercero(e.target.checked); setError('') }} /> Incluir escenario C
         </label>}
       </fieldset>
       {pronostico && <FichaPronostico key={'evaluacion-' + pronostico.pronostico} seleccion={seleccion} pronostico={pronostico} />}
+      <section aria-labelledby="simulaciones-parametros-titulo">
+        <h3 id="simulaciones-parametros-titulo">Parámetros de cada escenario</h3>
+        <p id="simulaciones-ayuda-inventario_disponible"><strong>Inventario hipotético inicial.</strong> Cantidad disponible al
+          comienzo del período simulado.</p>
+        <p id="simulaciones-ayuda-tiempo_abastecimiento"><strong>Plazo de abastecimiento.</strong> Días naturales completos de
+          espera, de 0 a 15, en números enteros. Si hay reposición, se recibe al inicio del día siguiente a la espera.
+          Con 0 llega el día 1. Con 15 llega fuera del período simulado.</p>
+        <p id="simulaciones-ayuda-reserva"><strong>Reserva objetivo.</strong> Cantidad que desea mantener al final del período
+          si la reposición llega a tiempo. Es un objetivo final y no garantiza un mínimo durante todos los días.</p>
+        <details>
+          <summary>Ver ejemplo y formato de los valores</summary>
+          <p><strong>Ejemplo ilustrativo.</strong> Inventario inicial de 100, plazo de 3 días y reserva objetivo de 20.
+            Si corresponde una reposición, se recibiría al inicio del día 4.</p>
+          <p id="simulaciones-parametros-ayuda" className="help-text">Ingrese cantidades no negativas con punto decimal y
+            hasta 64 caracteres por cantidad. Use 0 para cero entero, 0.0 para cero decimal y -0.0 para cero negativo decimal.
+            Puede usar notación científica, como 1e2. Para el plazo, escriba un entero de 0 a 15 sin decimales.</p>
+        </details>
+      </section>
       {campos.slice(0, numeroEscenarios).map((escenario, i) =>
-        <fieldset disabled={bloqueado} key={i} aria-describedby="simulaciones-parametros-ayuda">
+        <fieldset disabled={bloqueado} key={i}>
           <legend>Escenario {'ABC'[i]}</legend>
           <div className="simulaciones-filtros">
             {CAMPOS.map(([campo, rotulo]) => <label key={campo}>{rotulo}
               <input type="text" inputMode={campo === 'tiempo_abastecimiento' ? 'numeric' : 'text'}
+                aria-describedby={`simulaciones-ayuda-${campo}${campo === 'tiempo_abastecimiento' ? '' : ' simulaciones-parametros-ayuda'}`}
                 value={escenario[campo]} onChange={e => {
                   const valor = e.target.value
                   setCampos(anteriores => anteriores.map((x, j) => j === i ? { ...x, [campo]: valor } : x))
@@ -1230,11 +1251,12 @@ export default function Simulaciones({ activo, seleccion, selector, transferenci
       {avisoTransferencia && <p role={avisoTransferencia.tipo === 'confirmada' ? 'status' : 'alert'}>
         {avisoTransferencia.mensaje}
       </p>}
-      <p>Los parámetros son hipotéticos. El dataset no contiene inventario observado y el registro no genera órdenes de compra.</p>
+      <p>La simulación explora condiciones hipotéticas de inventario. El conjunto registra ventas observadas y carece de
+        datos de inventario observado. Los resultados sirven para comparar escenarios, sin emitir órdenes de compra ni
+        ofrecer recomendaciones automáticas o garantías de cobertura.</p>
       <SelectorSerie {...selector} idPrefix="simulaciones-creacion" />
       {seleccion && !segura && <p role="alert">La selección contiene un identificador fuera del rango seguro del navegador.</p>}
       {!seleccion && <p role="status">Seleccione una tienda y una familia del conjunto activo para crear una simulación.</p>}
-      <p id="simulaciones-parametros-ayuda" className="help-text">Ingrese cantidades no negativas con punto decimal. Use 0 para cero entero, 0.0 para cero decimal y -0.0 para cero negativo. Cada cantidad admite hasta 64 caracteres. El plazo admite enteros de 0 a 15 días.</p>
       {segura && seleccion && <FormularioSimulacion key={contexto} seleccion={seleccion}
         bloqueado={bloqueado} registrar={intencion => { void registrar(intencion) }}
         transferencia={coincideContexto && !bloqueado ? transferencia : null}

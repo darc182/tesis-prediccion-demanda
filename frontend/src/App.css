@@ -1142,6 +1142,10 @@ form.forecast-form > div:has(> :is(#forecast-technique, #forecast-cutoff)) { ali
   margin-bottom: 10px;
 }
 
+.simulaciones-formulario fieldset > .simulaciones-filtros > label {
+  grid-template-rows: 1fr auto;
+}
+
 .simulaciones-formulario select {
   max-width: 100%;
   min-width: 0;
