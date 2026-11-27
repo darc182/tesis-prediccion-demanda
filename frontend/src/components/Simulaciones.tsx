@@ -1,5 +1,8 @@
 import { useEffect, useImperativeHandle, useId, useRef, useState, type ComponentProps, type FormEvent, type ReactNode, type Ref } from 'react'
 import SelectorSerie, { type SerieTemporal } from './SelectorSerie'
+import ConfiguracionPronosticoGuardada from './ConfiguracionPronosticoGuardada'
+import { generacionListadoValida, identificarCandidato, mostrarFechaGeneracion, useConfiguracionGuardada,
+  type CandidatoConfiguracion } from './consultaConfiguracionPronostico'
 
 const HISTORIAL = '/api/simulaciones/historial'
 const MAX_SQLITE = 9223372036854775807n
@@ -715,7 +718,7 @@ export type AvisoTransferencia = { tipo: 'confirmada' | 'rechazada'; mensaje: st
 type ConsumirTransferencia = (evento: number, aviso: AvisoTransferencia) => void
 
 type Pronostico = ReturnType<typeof identidad>
-type PronosticoElegible = Pronostico & { codigoTecnica: keyof typeof TECNICAS }
+type PronosticoElegible = Pronostico & { candidato: CandidatoConfiguracion }
 type Modalidad = 'individual' | 'comparacion'
 type Campos = { inventario_disponible: string; tiempo_abastecimiento: string; reserva: string }
 type Intencion = Readonly<{
@@ -763,11 +766,12 @@ function leerPronosticos(valor: unknown, seleccion: SeleccionActiva) {
       typeof p.tecnica !== 'string' || !Object.hasOwn(TECNICAS, p.tecnica) ||
       typeof p.id !== 'number' || !Number.isSafeInteger(p.id) || p.id <= 0 ||
       typeof p.experimento_id !== 'number' || !Number.isSafeInteger(p.experimento_id) || p.experimento_id <= 0) continue
-    verificar(!vistos.has(p.id))
+    verificar(!vistos.has(p.id) && generacionListadoValida(p.fecha_generacion))
     vistos.add(p.id)
     elegibles.push({
       ...identidad({ ...p, pronostico_id: p.id }),
-      codigoTecnica: p.tecnica as keyof typeof TECNICAS,
+      candidato: { id: p.id, experimento_id: p.experimento_id, tecnica: p.tecnica as keyof typeof TECNICAS,
+        fecha_corte: p.fecha_corte, horizonte: p.horizonte, fecha_generacion: p.fecha_generacion },
     })
   }
   return elegibles
@@ -960,7 +964,8 @@ async function consultarEvaluacionPronostico(
   }
 }
 
-function FichaPronostico({ seleccion, pronostico }: { seleccion: SeleccionActiva; pronostico: Pronostico }) {
+function FichaPronostico({ seleccion, pronostico }: { seleccion: SeleccionActiva; pronostico: PronosticoElegible }) {
+  const inspector = useConfiguracionGuardada(seleccion, claveContexto(seleccion))
   const id = useId()
   const [evaluacion, setEvaluacion] = useState<Estado<ReturnType<typeof leerEvaluacionPronostico>>>({ tipo: 'inicial' })
   const consulta = useRef<AbortController | null>(null)
@@ -989,10 +994,15 @@ function FichaPronostico({ seleccion, pronostico }: { seleccion: SeleccionActiva
     <Datos campos={[
       ['Pronóstico', pronostico.pronostico], ['Experimento', pronostico.experimento],
       ['Técnica predictiva', pronostico.tecnica], ['Corte de validación', <FechaResumen iso={pronostico.corte} />],
+      ['Fecha de generación', mostrarFechaGeneracion(pronostico.candidato.fecha_generacion)],
       ['Período objetivo (15 días)', <><FechaResumen iso={fechas[0]} /> a <FechaResumen iso={fechas[fechas.length - 1]} /></>],
     ]} />
     <p>La predicción estima la demanda agregada de una familia en una tienda. Los escenarios A, B y C comparten este
       pronóstico y representan distintas condiciones hipotéticas de inventario.</p>
+    <button type="button" aria-label={`Ver configuración del pronóstico ${pronostico.pronostico}`}
+      disabled={inspector.consulta?.estado.kind === 'loading'}
+      onClick={() => { void inspector.consultar(pronostico.candidato) }}>Ver configuración</button>
+    <ConfiguracionPronosticoGuardada inspector={inspector} />
     <h4>Métricas de validación</h4>
     <p>La consulta es una evaluación actual por GET y no guarda resultados. Un error menor en este corte no demuestra
       un mejor desempeño general.</p>
@@ -1058,7 +1068,7 @@ function FormularioSimulacion({ seleccion, bloqueado, registrar, transferencia, 
         if (!solicitud) return
         porSeleccionar.current = null
         const coincidencia = datos.find(p => p.pronostico === solicitud.pronosticoId &&
-          p.experimento === solicitud.experimentoId && p.codigoTecnica === solicitud.tecnica && p.corte === solicitud.corte)
+          p.experimento === solicitud.experimentoId && p.candidato.tecnica === solicitud.tecnica && p.corte === solicitud.corte)
         if (coincidencia) {
           setId(String(coincidencia.pronostico))
           consumirTransferencia(solicitud.evento, {
@@ -1112,7 +1122,7 @@ function FormularioSimulacion({ seleccion, bloqueado, registrar, transferencia, 
           <select value={id} onChange={e => { setId(e.target.value); setError('') }}>
             <option value="">Seleccione un pronóstico</option>
             {lista.datos.map(p => <option value={p.pronostico} key={p.pronostico}>
-              {p.tecnica} · {p.corte} · 15 días · Pronóstico {p.pronostico} · Experimento {p.experimento}
+              {identificarCandidato(p.candidato)} · 15 días
             </option>)}
           </select>
         </label>

@@ -548,7 +548,9 @@ form.forecast-form > div:has(> :is(#forecast-technique, #forecast-cutoff)) { ali
 .forecast-list-header h3 { margin: 0; }
 .forecast-history-actions button { display: block; }
 .forecast-history-actions button + button { margin-top: 8px; }
-.forecast-configuration { padding: 16px; border: 1px solid var(--border); border-radius: 8px; overflow-wrap: anywhere; }
+.forecast-selected li + li { margin-top: 12px; }
+.forecast-selected-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.forecast-configuration { margin-top: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; overflow-wrap: anywhere; }
 .forecast-configuration h4, .forecast-configuration h5 { margin: 0 0 12px; color: var(--text-h); font-size: 1rem; }
 .forecast-configuration-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 12px; margin: 16px 0; }
 .forecast-configuration-fields dt { font-size: 0.9rem; }
@@ -815,7 +817,8 @@ form.forecast-form > div:has(> :is(#forecast-technique, #forecast-cutoff)) { ali
 .evaluation-options { margin: 18px 0 12px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; min-width: 0; }
 .evaluation-options legend { padding: 0 6px; font-weight: 600; }
 .evaluation-options label { display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; cursor: pointer; }
-.evaluation-options label + label { border-top: 1px solid var(--border); }
+.evaluation-candidate { padding-bottom: 12px; }
+.evaluation-candidate + .evaluation-candidate { border-top: 1px solid var(--border); }
 .evaluation-options input { flex: 0 0 auto; width: 20px; height: 20px; margin: 4px 0 0; accent-color: var(--accent); }
 .evaluation-order { padding-left: 25px; margin: 14px 0; }
 .evaluation-order li + li { margin-top: 8px; }

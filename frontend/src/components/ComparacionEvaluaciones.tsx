@@ -2,6 +2,9 @@ import { useEffect, useId, useRef, useState, type Dispatch, type SetStateAction 
 import type { SerieTemporal, SeriesState } from './SelectorSerie'
 import ConsolidacionEvaluaciones from './ConsolidacionEvaluaciones'
 import type { DestinoSimulacion } from './Simulaciones'
+import ConfiguracionPronosticoGuardada from './ConfiguracionPronosticoGuardada'
+import { generacionListadoValida, identificarCandidato, useConfiguracionGuardada,
+  type CandidatoConfiguracion } from './consultaConfiguracionPronostico'
 
 type Seleccion = { conjuntoId: number; serie: SerieTemporal }
 type Props = {
@@ -16,7 +19,7 @@ const TECNICAS = {
   hist_gradient_boosting: 'HistGradientBoosting',
 } as const
 type Tecnica = keyof typeof TECNICAS
-type Opcion = { id: number; experimento_id: number; tecnica: Tecnica; fecha_corte: Corte }
+type Opcion = CandidatoConfiguracion & { fecha_corte: Corte }
 type Eleccion = { corte: Corte; opciones: Opcion[] }
 type Detalle = {
   paso: number; fecha_objetivo: string; venta_estimada: number
@@ -101,7 +104,9 @@ function leerLista(v: unknown, seleccion: Seleccion): { opciones: Opcion[]; tota
         !idValido(p.horizonte) || ids.has(p.id)) return null
     ids.add(p.id)
     if (p.tipo === 'validacion' && p.horizonte === 15 && corteValido(p.fecha_corte)) {
-      opciones.push({ id: p.id, experimento_id: p.experimento_id, tecnica: p.tecnica, fecha_corte: p.fecha_corte })
+      if (!generacionListadoValida(p.fecha_generacion)) return null
+      opciones.push({ id: p.id, experimento_id: p.experimento_id, tecnica: p.tecnica, fecha_corte: p.fecha_corte,
+        horizonte: p.horizonte, fecha_generacion: p.fecha_generacion })
     }
   }
   // Orden de presentación estable; el orden de selección se conserva aparte.
@@ -288,6 +293,8 @@ function PanelComparacion({ seleccion, eleccion, setEleccion, simular }: PanelPr
   const [lista, setLista] = useState<Lista>({ kind: 'loading' })
   const [consulta, setConsulta] = useState<Consulta>({ kind: 'idle' })
   const [revision, setRevision] = useState(0)
+  const inspector = useConfiguracionGuardada(seleccion, lista.kind === 'success'
+    ? JSON.stringify([seleccion.conjuntoId, seleccion.serie.id, seleccion.serie.store_nbr, seleccion.serie.family, eleccion.corte, revision]) : null)
   const listado = useRef<AbortController | null>(null)
   const comparacion = useRef<AbortController | null>(null)
   const identidad = useRef(0)
@@ -380,9 +387,16 @@ function PanelComparacion({ seleccion, eleccion, setEleccion, simular }: PanelPr
       <fieldset className="evaluation-options" aria-describedby={`${id}-ayuda`}><legend>Pronósticos disponibles para {eleccion.corte}</legend>
         {disponibles.map(p => {
           const posicion = eleccion.opciones.findIndex(o => o.id === p.id)
-          return <label key={p.id}><input type="checkbox" checked={posicion >= 0}
-            disabled={posicion < 0 && eleccion.opciones.length === 3} onChange={() => alternar(p)} />
-            <span>{etiqueta(p)} · corte {p.fecha_corte}{posicion >= 0 && <strong> · posición {posicion + 1}</strong>}</span></label>
+          return <div className="evaluation-candidate" key={p.id}>
+            <label><input type="checkbox" checked={posicion >= 0}
+              disabled={posicion < 0 && eleccion.opciones.length === 3} onChange={() => alternar(p)} />
+              <span>{identificarCandidato(p)}{posicion >= 0 && <strong> · posición {posicion + 1}</strong>}</span>
+            </label>
+            <button type="button" aria-label={`Ver configuración del pronóstico ${p.id}`}
+              disabled={inspector.consulta?.estado.kind === 'loading' && inspector.consulta.pronostico.id === p.id}
+              onClick={() => { void inspector.consultar(p, String(p.id)) }}>Ver configuración</button>
+            <ConfiguracionPronosticoGuardada inspector={inspector} ubicacion={String(p.id)} />
+          </div>
         })}
       </fieldset>
       <p id={`${id}-ayuda`}>Elija dos o tres. El orden de selección será el orden de los resultados; desmarque para cambiarlo.</p>
